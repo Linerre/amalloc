@@ -17,20 +17,18 @@
 #define ADD_BYTES(ptr, n) ((void *) (((char *) (ptr)) + (n)))
 
 
-/** This is the Block struct, which contains all metadata needed for your 
- *  explicit free list. You are allowed to modify this struct (and will need to 
- *  for certain optimisations) as long as you don't move the definition from 
+/** This is the Block struct, which contains all metadata needed for your
+ *  explicit free list. You are allowed to modify this struct (and will need to
+ *  for certain optimisations) as long as you don't move the definition from
  *  this file. **/
 typedef struct Block Block;
 
 struct Block {
-  // Size of the block, including meta-data size.
-  size_t size;
+  // header encodes block size + meta-data size and AP flags
+  size_t header;
   // Next and Prev blocks
   Block *next;
   Block *prev;
-  // Is the block allocated or not?
-  bool allocated;
 };
 
 // Word alignment
@@ -52,7 +50,7 @@ void my_free(void *p);
 int is_free(Block *block);
 size_t block_size(Block *block);
 
-Block *get_start_block(void); 
+Block *get_start_block(void);
 Block *get_next_block(Block *block);
 
 Block *ptr_to_block(void *ptr);

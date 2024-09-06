@@ -17,4 +17,6 @@ uid: u7753813
 # do not remove the "---"!
 ---
 # References
-- [1] Example Author. 2023. example code video. Retrieved from https://example.com/video
+- [1] glicb wiki. 2022. MallocInternals. Retrieved from https://sourceware.org/glibc/wiki/MallocInternals
+- [2] Intranautic. 2022. Glibc PTMalloc Internals. Retrieved from https://intranautic.com/posts/glibc-ptmalloc-internals
+- [3] Doug Lea. 2000. A Memory Allocator. Retrieved from https://gee.cs.oswego.edu/dl/html/malloc.html
