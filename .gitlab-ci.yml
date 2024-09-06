@@ -348,8 +348,11 @@ test:bench:
     paths: 
       - "benchmark-results.txt"
   script:
-    - make bench
-    - RESULT=$(./bench/benchmark > benchmark-results.txt 2>&1)
+    - make clean
+    - make bench RELEASE=1
+    - RESULT=0
+    - ./bench/benchmark > benchmark-results.txt 2>&1 || RESULT=$?
+    - cat benchmark-results.txt
     - if [ "${RESULT}" != "0" ]; then
     -   exit 1;
     - fi
