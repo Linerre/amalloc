@@ -69,6 +69,7 @@ static struct malloc_state {
 } mstate;
 
 /* --------------------- Helper functions --------------------- */
+/* TODO: convert these simple functions to funciton-like macros */
 /** Helper functions for block metadata **/
 void set_abit(Block* bptr)
 {
@@ -141,34 +142,24 @@ Block* init_heap(void)
   }
 
   struct malloc_state *mst = &mstate;
+
+  /* Set fenceposts at both start and end of the heap */
+  Block *dm_head = heap;
+  Block *dm_tail = (Block*) ((char*)heap + (kMemorySize - kMetadataSize));
+  dm_head->header = 0;
+  dm_head->prev = NULL;
+  dm_head->next = heap + 1;
+  dm_tail->header = 0;
+  dm_tail->next = NULL;
+  dm_tail->prev = dm_tail - 1;
+
+  /* TODO: store top at dummy head or the first allocable chunk? */
   mst->top = heap;
 
-  /* Init bins to make each a double-linked list with dummy head and tail */
-  for(size_t i = 0; i < N_LISTS; i++) {
-    /* move to next size class or skip the very fisrt metadata */
-    heap++;
-
-    /* dummy head */
-    mst->bins[i] = heap;
-    heap->header = 0;
-    heap->prev = NULL;
-    heap->next = heap + 1;
-
-    /* dummy tail */
-    heap->next->header = 0;
-    heap->next->prev = heap;
-    heap->next->next = NULL;
-  }
-
   /* Record remaining space */
-  mst->remainder = kMemorySize - (N_LISTS * 2 * kMetadataSize) - kMetadataSize;
-
-  /* Restore heap */
-  heap = mst->top;
-  heap->prev = NULL;
+  mst->remainder = kMemorySize - (2 * kMetadataSize);
 
   /* TODO: how do i know where to allocate and split for the first time? */
-
   return heap;
 }
 
@@ -254,6 +245,7 @@ int main(int argc, char* argv[])
 {
 
   Block* bptr = init_heap();
+
 
   size_t need = 64ull<<20;
   need = align(need);
