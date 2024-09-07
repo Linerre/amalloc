@@ -1,87 +1,178 @@
 #include "mymalloc.h"
 
-// Word alignment
+/* --------------------- Assigment requirements --------------------- */
 const size_t kAlignment = sizeof(size_t);
-// Minimum allocation size (1 word)
+/* Minimum allocation size (1 word) */
 const size_t kMinAllocationSize = kAlignment;
-// Size of meta-data per Block
+/* Size of meta-data per Block */
 const size_t kMetadataSize = sizeof(Block);
-// Maximum allocation size (128 MB)
+/* Maximum allocation size (128 MB) */
 const size_t kMaxAllocationSize = (128ull << 20) - kMetadataSize;
-// Memory size that is mmapped (64 MB)
+/* Memory size that is mmapped (64 MB) */
 const size_t kMemorySize = (64ull << 20);
 
-/* Ptr to the start of the initial heap (64MB); scoped to this file only */
-static Block* INIT_HEAD = NULL;
+/* TODO:
+   1. Free chunks are stored in circular doubly-linked lists
+   2.
+ */
 
-/* Segerated lists with each list aligned to multiples of 8 bytes  */
-Block* seglists[N_LISTS] = {
-  NULL,                         /* [      1,       8]         */
-  NULL,                         /* [      9,      16]         */
-  NULL,                         /* [     17,      32]         */
-  NULL,                         /* [     33,      64]         */
-  NULL,                         /* [     65,     128]         */
-  NULL,                         /* [    129,     256]         */
-  NULL,                         /* [    257,     512]         */
-  NULL,                         /* [    513,    1024] (1KB)   */
-  NULL,                         /* [   1025,    2048] (2KB)   */
-  NULL,                         /* [   2049,    4096] (4KB)   */
-  NULL,                         /* [   4097,    8192] (8KB)   */
-  NULL,                         /* [   8193,  16,384] (16KB)  */
-  NULL,                         /* [ 16,385,  32,768] (32KB)  */
-  NULL,                         /* [ 32,769,  65,536] (64KB)  */
-  NULL,                         /* [ 65,537, 131,072] (128KB) */
-  NULL,                         /* [131,073, 262,144] (256KB) */
-  NULL,                         /* 256KB < any <= 64MB        */
-};
+/* ------------------ Global, file-local constants ------------------ */
+/* The aligment mask */
+static const size_t ALIGN_MASK = kAlignment - 1;
+/* The smallest possible chunk */
+static const size_t MIN_CHUNK_SIZE = kMetadataSize + kMinAllocationSize + kAlignment;
+/* The smallest size allocable is an aligned minial chunk */
+static const size_t MINSIZE = (MIN_CHUNK_SIZE + ALIGN_MASK) & ~ALIGN_MASK;
 
-/* Helper functions for block metadata */
-void set_abit(Block* bptr);
-void unset_abit(Block* bptr);
-void set_pbit(Block* bptr);
-void unset_pbit(Block* bptr);
-size_t get_real_size(Block* bptr);
+/* Small bin upper bound (256B) */
+static const size_t SBINBOUND = (1UL << 8);
+/* Medium bin upper bound (1KB) */
+static const size_t MBINBOUND = (1UL << 10);
+/* Large bin upper bound (4KB)  */
+static const size_t LBINBOUND = (1UL << 10);
 
-/* Helper functions for seglist */
-size_t find_sclass_index(size_t size);
-static inline size_t align(size_t size);
-int need_init(void);
-Block* init_heap(void);
+static Block *HEAP_TOP = NULL;
 
+/* --------------------- Internal data structures --------------------- */
+/*
+  Segerated lists (Bins) with each list aligned to multiples of 8 bytes
 
-/* core fns for allocation and deallocation */
-void *my_malloc(size_t size) {
-  /* FIXME: handle size > kMaxAllocationSize */
-  if (size == 0)
+  Indexing
+
+  List for size < 256 bytes contain chunks of all the same size, spaced
+  8 bytes apart.  Larger lists are approximately logarithmically spaced:
+
+  32 bins of size            8
+  16 bins of size           64
+   4 bins of size          512
+   2 bins of size         4096
+   1 bins of size  what's left
+ */
+Block* seglists[N_LISTS];
+
+/* ------------------- Internal state representation ------------------- */
+/*
+  Global, file-local state for this mallocator implementation.  The state
+  tracks information that the allocator should be aware of before some time
+  consuming operations (such as coalesing, mmap and splitting) so that it
+  can be as lazy as possible.
+ */
+static struct malloc_state {
+  /* list of bins or size classes */
+  Block *bins[N_LISTS];
+
+  /* Top end of the allocated 64MB from one mmp call */
+  Block *top;
+
+  /* the remaining, allocable space */
+  size_t remainder;
+} mstate;
+
+/* --------------------- Helper functions --------------------- */
+/** Helper functions for block metadata **/
+void set_abit(Block* bptr)
+{
+  bptr->header |= 1;
+}
+
+void unset_abit(Block* bptr)
+{
+  bptr->header &= ~1;
+}
+
+void set_pbit(Block* bptr)
+{
+  bptr->header |= (1 << 1);
+}
+
+void unset_pbit(Block* bptr)
+{
+  bptr->header &= ~(1 << 1);
+}
+
+size_t get_real_size(Block* bptr)
+{
+  return bptr->header & ~2;
+}
+
+/* Helper functions for seglists */
+int need_init(void)
+{
+  return HEAP_TOP == NULL;
+}
+
+size_t find_sclass(size_t asize) /* aligned size */
+{
+  /* Best fit for request larger than 256KB */
+  if (asize >= ((size_t)1<<8))
+    return 16;
+
+  size_t class = 0;
+  size_t bound = 4;             /* 0b100 */
+  while((bound <<= 1) < asize)
+    class++;
+
+  return class;
+}
+
+static inline size_t align(size_t size)
+{
+  const size_t mask = kAlignment - 1;
+  return (size + mask) & ~mask;
+}
+
+/*
+  Initialize the `heap', which is the memory chunk totaling 64MB
+  to be used for future allocations unless it can no longer satisfiy
+ */
+Block* init_heap(void)
+{
+  Block* heap = mmap(NULL,                        /* let kernel decide */
+                     kMemorySize,                 /* 64MB at a time    */
+                     PROT_READ | PROT_WRITE,      /* prot              */
+                     MAP_PRIVATE | MAP_ANONYMOUS, /* flags             */
+                     0,                           /* fd                */
+                     0                            /* offset            */
+                     );
+
+  if (heap == MAP_FAILED) {
+    LOG("mmap failed: %s\n", strerror(errno));
     return NULL;
-
-  Block* heap;
-  if (need_init()) {
-   heap = (Block*) init_heap();
-   INIT_HEAD = heap;
-
-   if (heap == NULL)
-     return NULL;
   }
 
-  /* 1. align size to multiples of 8 */
-  size_t total_size = align(size);
+  struct malloc_state *mst = &mstate;
+  mst->top = heap;
 
-  /* 2. determin size class list */
-  size_t sclass_index = find_sclass_index(total_size);
+  /* Init bins to make each a double-linked list with dummy head and tail */
+  for(size_t i = 0; i < N_LISTS; i++) {
+    /* move to next size class or skip the very fisrt metadata */
+    heap++;
 
-  /* 3. find a best-fit free block for allocation */
+    /* dummy head */
+    mst->bins[i] = heap;
+    heap->header = 0;
+    heap->prev = NULL;
+    heap->next = heap + 1;
 
-  /* 4. allocate */
+    /* dummy tail */
+    heap->next->header = 0;
+    heap->next->prev = heap;
+    heap->next->next = NULL;
+  }
 
-  return NULL;
+  /* Record remaining space */
+  mst->remainder = kMemorySize - (N_LISTS * 2 * kMetadataSize) - kMetadataSize;
 
+  /* Restore heap */
+  heap = mst->top;
+  heap->prev = NULL;
+
+  /* TODO: how do i know where to allocate and split for the first time? */
+
+  return heap;
 }
 
-void my_free(void *ptr) {
-  return;
-}
-
+/* ----------------- Required helper functions ----------------- */
 /** These are helper functions you are required to implement for
  *  internal testing purposes. Depending on the optimisations you
  *  implement, you will need to update these functions yourself.
@@ -113,85 +204,62 @@ Block *ptr_to_block(void *ptr) {
   return ADD_BYTES(ptr, -((ssize_t) kMetadataSize));
 }
 
-/** Helper functions for block metadata **/
-void set_abit(Block* bptr)
-{
-  bptr->header |= 1;
-}
+/* ----------------- Core malloc/free functions ----------------- */
 
-void unset_abit(Block* bptr)
-{
-  bptr->header &= ~1;
-}
-
-void set_pbit(Block* bptr)
-{
-  bptr->header |= (1 << 1);
-}
-
-void unset_pbit(Block* bptr)
-{
-  bptr->header &= ~(1 << 1);
-}
-
-size_t get_real_size(Block* bptr)
-{
-  return bptr->header & ~2;
-}
-
-/* Helper functions for seglists */
-int need_init(void)
-{
-  return INIT_HEAD == NULL;
-}
-
-size_t find_sclass_index(size_t asize) /* aligned/rounded size */
-{
-  /* FIXME: handle the catch_all case N_LIST - 1 */
-  size_t index = 0;
-  size_t bound = 4;             /* 0b100 */
-  while((bound <<= 1) < asize)
-    index++;
-
-  return index;
-}
-
-static inline size_t align(size_t size)
-{
-  const size_t mask = kAlignment - 1;
-  return (size + mask) & ~mask;
-}
-
-/* Initialize the `heap', which is the memory chunk totaling 64MB to
-   be used for future allocations unless it cannot satisfiy  */
-Block* init_heap(void)
-{
-  Block* heap = mmap(NULL,                        /* let kernel decide */
-                     kMemorySize,                 /* 64MB at a time    */
-                     PROT_READ | PROT_WRITE,      /* prot              */
-                     MAP_PRIVATE | MAP_ANONYMOUS, /* flags             */
-                     0,                           /* fd                */
-                     0                            /* offset            */
-                     );
-  if (heap == MAP_FAILED) {
-    LOG("mmap failed: %s\n", strerror(errno));
+/*
+  `size' is user requested when calling this allocator. For a single
+  call of this function each time, word_size <= size <= 128MB;
+ */
+void *my_malloc(size_t size) {
+  /* FIXME: handle size >= kMaxAllocationSize */
+  if (size < kMinAllocationSize)
     return NULL;
+
+  Block *heap;
+  if (need_init()) {
+   heap = (Block*) init_heap();
+
+   if (heap == NULL)
+     return NULL;
   }
 
-  heap->header = kMemorySize;   /* PA: 00 */
-  heap->prev = NULL;
-  heap->next = NULL;
+  /* 1. align size(=requested + header) to multiples of 8 */
+  size_t total_size = align(size + kMetadataSize);
 
-  return heap;
+  /* 2. determin size class list */
+  size_t sclass_index = find_sclass(total_size);
+
+  /* 3. find a best-fit free block for allocation */
+  Block* cls_head = seglists[sclass_index];
+  if (cls_head == NULL) {       /* first use of this size class */
+    /* init dummy fenceposts */
+
+  } else {
+
+  }
+
+
+  /* 4. allocate */
+
+  return NULL;
+
 }
 
-/* Test section */
+void my_free(void *ptr) {
+  return;
+}
+
+/* ----------------- Test main ----------------- */
 int main(int argc, char* argv[])
 {
-  size_t need = 266;
+
+  Block* bptr = init_heap();
+
+  size_t need = 64ull<<20;
   need = align(need);
   printf("aligned need = %lu\n", need);
-  int index = find_sclass_index(need);
+  int index = find_sclass(need);
   printf("sclass index = %d\n", index);
+
   return 0;
 }
