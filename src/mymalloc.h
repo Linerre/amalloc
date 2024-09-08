@@ -31,6 +31,10 @@ struct Block {
   Block *prev;
 };
 
+/* internal state */
+struct malloc_state;
+typedef struct malloc_state *mstate;
+
 // Word alignment
 extern const size_t kAlignment;
 // Minimum allocation size (1 word)
