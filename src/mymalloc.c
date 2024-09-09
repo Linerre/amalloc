@@ -30,21 +30,22 @@ const size_t kMemorySize = (64ull << 20);
 #define PREV_INUSE 0x2
 #define SIZE_FLAGS (CURR_INUSE | PREV_INUSE)
 
-#define set_block_size(b,sz) ((b)->size = (sz))
+#define set_block_size(b, sz) ((b)->size = (sz))
 
 /* Set and unset the flags */
-#define set_block_inuse(b)   ((b)->size |= CURR_INUSE)
-#define set_block_free(b)    ((b)->size &= ~CURR_INUSE)
-#define set_prevb_inuse(b)   ((b)->size |= PREV_INUSE)
-#define set_prevb_free(b)    ((b)->size &= ~PREV_INUSE)
+#define set_block_inuse(b)    ((b)->size |= CURR_INUSE)
+#define set_block_free(b)     ((b)->size &= ~CURR_INUSE)
+#define set_prevb_inuse(b)    ((b)->size |= PREV_INUSE)
+#define set_prevb_free(b)     ((b)->size &= ~PREV_INUSE)
 
-#define set_size_inuse(b,sz) ((b)->size = (sz) | 1)
-#define set_size_free(b,sz)  ((b)->size = (sz) & ~1)
-#define set_psize_inuse(b)   ((b)->size |= 2)
-#define set_psize_free(b)    ((b)->size &= ~2)
+#define update_remainder(m, sz)  ((m)->remainder = (sz))
 
 /* Extract payload + overhead  */
-#define chunksize(b)         ((b)->size & ~7)
+#define blocksize(b)         ((b)->size & ~7)
+
+/* Check if `top' would hit the lowest boundary (head of largest bin) */
+#define checked_top(m, sz) \
+  ((blkptr) (char *)(m)->top - (sz) >= bin_at(m, N_LISTS))
 
 /* --------------------- Internal data structures --------------------- */
 /*
@@ -181,7 +182,7 @@ inline static void prepare_block(blkptr blk)
 static void init_fps_top(blkptr init_hh, mstate mst)
 {
 
-  size_t rm = kMemorySize - 2 * kMemorySize;
+  size_t rsz = kMemorySize - kMetadataSize;
   blkptr dm_start = init_hh;
   dm_start->size = 1;          /* 1 means initialized */
   dm_start->fd = init_hh + 1;
@@ -189,7 +190,7 @@ static void init_fps_top(blkptr init_hh, mstate mst)
   mst->lfp = dm_start;
 
   /* TODO: make this a macro */
-  blkptr dm_end = (blkptr) ((char*)init_hh + rm);
+  blkptr dm_end = (blkptr) ((char*)init_hh + rsz);
   dm_end->size = 1;
   dm_end->fd = NULL;
   dm_end->bk = dm_end - 1;
@@ -197,14 +198,17 @@ static void init_fps_top(blkptr init_hh, mstate mst)
 
   /* Update top as well */
   mst->top = dm_end->bk;
+  rsz -= kMetadataSize;
+  set_block_size(mst->top, rsz);
+  set_block_free(mst->top);
 
-  mst->remainder = rm;
+  update_remainder(mst, rsz);
 }
 
 static void init_bins(mstate mst)
 {
   int i;
-  blkptr bin = mst->top;
+  blkptr bin = mst->lfp + 1;
 
   /* Establish circular double-linked lists for bins.  These bin heads
      stored at heap start, immediately after the top fencepost */
@@ -214,7 +218,9 @@ static void init_bins(mstate mst)
     bin++;
   }
 
-  mst->remainder -= N_LISTS * kMetadataSize;
+  size_t rsz = mst->remainder - N_LISTS * kMetadataSize;
+  set_block_size(mst->top, rsz);
+  update_remainder(mst, rsz);
 }
 
 /*
@@ -236,8 +242,10 @@ static blkptr init_heap(void)
     return NULL;
   }
 
-  /* Set fenceposts at both start and end of the heap */
+
   mstate mst = &mmstate;
+
+  /* Set fenceposts at both start and end of the heap */
   init_fps_top(heap, mst);
 
   /* Init bins and place the initial chunk in the largest bin */
@@ -277,9 +285,9 @@ int find_next_nonempty_bin(mstate m, int bidx) {
 
 /* Insert a free block immediately after the head of a suitable bin */
 void insert_into_bin(mstate m, blkptr blk) {
-  size_t size = chunksize(blk);
-  int bindex = bin_index(size);
-  blkptr bin = bin_at(m, bindex);
+  size_t size = blocksize(blk);
+  int bidx = bin_index(size);
+  blkptr bin = bin_at(m, bidx);
 
   /* Insert at the head of the bin list */
   if (is_empty(bin)) {
@@ -296,14 +304,14 @@ void insert_into_bin(mstate m, blkptr blk) {
 
   /* FIXME: avoid repeated marking? */
   /* Mark the bin as non-empty in the binmap */
-  set_bin(m, bindex);
+  set_bin(m, bidx);
 }
 
-/* For the last bin only, split the `blk' at its high addr end for
-   allocation and return the remaining low-addr part as free */
+/* Split the `blk' at its high addr end for allocation, user getting
+   the high-addr part, remaining low-addr part as free */
 static blkptr split_block(blkptr blk, size_t asize)
 {
-  size_t rs = chunksize(blk) - asize - kMetadataSize;
+  size_t rs = blocksize(blk) - asize - kMetadataSize;
   blkptr mblock;
 
   if (rs >= MINSIZE) {          /* remaining allocable on its own */
@@ -321,6 +329,44 @@ static blkptr split_block(blkptr blk, size_t asize)
   }
 }
 
+/* Allocate a free block from given non-empty bin, taking the last
+   free block in the bin and returning pointer to the usable addr of
+   the free block.   */
+static blkptr __alloc_from_bin(mstate m, int bidx)
+{
+  blkptr bin = bin_at(m, bidx);
+  blkptr fblk;
+
+  if (has_one(bin)) {           /* only one free block */
+    fblk = bin->fd;
+    /* unlink */
+    bin->fd = bin->bk = bin;
+  } else {                      /* 2 or more free blocks */
+    fblk = bin->bk;
+    /* unlink */
+    bin->bk = bin->bk->bk;
+    bin->bk->fd = bin;
+  }
+
+  set_block_inuse(fblk);
+
+  return fblk;
+}
+
+static blkptr __alloc_from_top(mstate m, size_t sz)
+{
+  blkptr mblk = m->top;
+  mblk = (blkptr) ((char *)mblk - sz + kMetadataSize);
+  set_block_size(mblk, sz);
+  set_block_inuse(mblk);
+  /* TODO: zero the free block? */
+
+  m->top = mblk - 1;
+  update_remainder(m, m->remainder - sz);
+
+  return mblk;
+}
+
 
 /* ----------------- Required helper functions ----------------- */
 /** These are helper functions you are required to implement for
@@ -335,7 +381,7 @@ int is_free(blkptr block) {
 
 /* Returns the size of the given block */
 size_t block_size(blkptr block) {
-  return chunksize(block);
+  return blocksize(block);
 }
 
 /* Returns the first block in memory (excluding fenceposts) */
@@ -359,16 +405,17 @@ blkptr ptr_to_block(void *ptr) {
   `size' is user requested when calling this allocator. For a single
   call of this function each time, word_size <= size <= 128MB;
  */
-void *my_malloc(size_t size) {
+void* my_malloc(size_t size)
+{
   /* FIXME: handle size >= kMaxAllocationSize */
   if (size < kMinAllocationSize)
     return NULL;
 
   blkptr heap;
-  struct malloc_state *mst = &mmstate;
+  mstate mst = &mmstate;
 
   if (malloc_initialized < 0) {
-    heap = (blkptr) init_heap();
+    heap = init_heap();
 
     if (heap == NULL)
       return NULL;
@@ -378,51 +425,41 @@ void *my_malloc(size_t size) {
 
 
   /* 1. align requested size to multiple of 8 */
-  size_t chunk_asize = req2size(size);
+  size_t blk_asize = req2size(size);
+  size_t total_asz = blk_asize + kMetadataSize;
 
   /* 2. determin size class list */
-  int bindex = bin_index(chunk_asize);
+  int bidx = bin_index(blk_asize);
 
-  /* 3. find a best-fit free block for allocation */
-  if (get_binmap(mst, bindex)) {
-    blkptr bin = bin_at(mst, bindex);
-    if (has_one(bin)) {         /* only 1 free blocks */
-      heap = bin->fd;
-      prepare_block(heap);
-      /* unlink */
-      bin->fd = bin->bk = bin;
-    } else {                    /* 2 or more free blocks */
-      heap = bin->bk;
-      /* unlink */
-      bin->bk = bin->bk->bk;
-      bin->bk->fd = bin;
-      prepare_block(heap);
+  /*
+    Searching for a suitable block
+    if match-bin-non-empty
+      allocate from bin
+    else if top has space
+      allocate from top
+    else
+      search through larger bins
+      try coalecing first
+   */
+
+  if (get_binmap(mst, bidx)) {
+    heap = __alloc_from_bin(mst, bidx);
+  }
+  else if (checked_top(mst, total_asz)) {
+    heap = __alloc_from_top(mst, total_asz);
+  }
+  else {
+    /* search for the next larger non-empty first */
+    int nbidx = find_next_nonempty_bin(mst, bidx);
+    if (nbidx > 0) {            /* splitting */
+      blkptr rm = split_block(heap, blk_asize);
+      if (rm != NULL)
+        insert_into_bin(mst, rm);
+    }
+    else {                      /* last hope before new mmap syscall */
+      /* TODO: coalescing if no bin satiscify and try to allocate */
     }
 
-  } else {
-
-    /* Update bindex to the nearest larger non-empty bin*/
-    bindex = find_next_nonempty_bin(mst, bindex);
-    if (bindex < 0)
-      return NULL;
-
-    /* Taking a free block from tail of the bin  */
-    blkptr bin = bin_at(mst, bindex);
-    if (has_one(bin)) {         /*  1 free blocks */
-      heap = bin->fd;
-      /* unlink */
-      bin->fd = bin->bk = bin;
-    } else {                    /* 2 or more free blocks */
-      heap = bin->bk;
-      /* unlink */
-      bin->bk = bin->bk->bk;
-      bin->bk->fd = bin;
-    }
-
-    /* split and insert remaining back */
-    blkptr rm = split_block(heap, chunk_asize);
-    if (rm != NULL)
-      insert_into_bin(mst, rm);
   }
 
   /* 4. allocate */
@@ -439,19 +476,18 @@ void my_free(void *ptr) {
 int main(int argc, char* argv[])
 {
 
-  blkptr bptr = my_malloc(173);
+  int* fib = my_malloc(173); /* aligned to 176 */
 
-  int *ptr1 = malloc(1000);
-  int *ptr2 = malloc(1000);
-  int *ptr3 = malloc(1000);
+  printf("Allocated heap start = %p\n", fib);
 
-  printf("ptr1 = %p", ptr1);
-  printf("ptr2 = %p", ptr2);
-  printf("ptr3 = %p", ptr3);
 
-  free(ptr1);
-  free(ptr2);
-  free(ptr3);
+  int i;
+  fib[0] = 0;
+  fib[1] = 1;
+
+  for (i=2;i<10;i++)
+    fib[i] = fib[i-1] + fib[i-2];
+
 
   /* assert (bptr != NULL); */
   /* test small bin index */
