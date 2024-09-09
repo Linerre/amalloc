@@ -3,7 +3,6 @@
 
 #include <stddef.h>
 #include <stdio.h>
-#include <stdbool.h>
 #include <sys/mman.h>
 
 #ifdef ENABLE_LOG
@@ -22,13 +21,16 @@
  *  for certain optimisations) as long as you don't move the definition from
  *  this file. **/
 typedef struct Block Block;
+typedef struct Block *blkptr;
+typedef unsigned long uint32;
+typedef unsigned long long uint64;
 
 struct Block {
-  // header encodes block size + meta-data size and AP flags
-  size_t header;
-  // Next and Prev blocks
-  Block *next;
-  Block *prev;
+
+  size_t size;                  /* chunk size, including overhead */
+
+  Block *fd;                    /* forward  */
+  Block *bk;                    /* backward */
 };
 
 /* internal state */
