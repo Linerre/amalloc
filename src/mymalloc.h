@@ -26,9 +26,7 @@ typedef unsigned long uint32;
 typedef unsigned long long uint64;
 
 struct Block {
-
   size_t size;                  /* chunk size, including overhead */
-
   Block *fd;                    /* forward  */
   Block *bk;                    /* backward */
 };

@@ -14,6 +14,7 @@ const size_t kMemorySize = (64ull << 20);
 
 /* ------------------ Size and alignment checks ------------------ */
 #define ALIGN_MASK     (kAlignment - 1)
+#define TAGS_SIZE      (kMetadataSize - kAlignment)
 
 /* The smallest possible block with overhead */
 #define MIN_BLOCK_SIZE (kMetadataSize + kMinAllocationSize + kAlignment)
@@ -22,15 +23,24 @@ const size_t kMemorySize = (64ull << 20);
 #define MINSIZE        ((MIN_BLOCK_SIZE + ALIGN_MASK) & ~ALIGN_MASK)
 
 /* Round up the requested size to multiple of word size */
-#define req2size(req)            (((req) + ALIGN_MASK) & ~ALIGN_MASK)
-#define checked_req2size(req)    (((req) + ALIGN_MASK) & ~ALIGN_MASK)
+#define req2size(req)          (((req) + ALIGN_MASK) & ~ALIGN_MASK)
+/* #define checked_req2size(req)  (((req) + ALIGN_MASK) & ~ALIGN_MASK) */
 
 /* ------------------ Heap block operations  ------------------ */
 #define CURR_INUSE 0x1
 #define PREV_INUSE 0x2
 #define SIZE_FLAGS (CURR_INUSE | PREV_INUSE)
 
+/* Extract payload + overhead  */
+#define blocksize(b)         ((b)->size & ~7)
+
 #define set_block_size(b, sz) ((b)->size = (sz))
+#define set_block_foot(b) \
+{ \
+  size_t sz = blocksize(b); \
+  size_t *ft = (size_t *) ((char *)b + sz - kAlignment); \
+  *ft = sz; \
+}
 
 /* Set and unset the flags */
 #define set_block_inuse(b)    ((b)->size |= CURR_INUSE)
@@ -39,13 +49,17 @@ const size_t kMemorySize = (64ull << 20);
 #define set_prevb_free(b)     ((b)->size &= ~PREV_INUSE)
 
 #define update_remainder(m, sz)  ((m)->remainder = (sz))
+#define prepare_allocblk(b) \
+  ((b) = (blkptr) ((char *)b - (2 * sizeof(blkptr))))
 
-/* Extract payload + overhead  */
-#define blocksize(b)         ((b)->size & ~7)
+#define update_top(m, b) ((m)->top = (b) - 1);
 
-/* Check if `top' would hit the lowest boundary (head of largest bin) */
+#define at_lfp(m)    ((char *) ((m)->lfp) + kMetadataSize)
+#define at_hfp(m)    ((char *) ((m)->hfp))
+
+/* Check if `top' would hit the lowest boundary (lfp) */
 #define checked_top(m, sz) \
-  ((blkptr) (char *)(m)->top - (sz) >= bin_at(m, N_LISTS))
+  (((char *)((m)->top) - (sz)) >= at_lfp(m))
 
 /* --------------------- Internal data structures --------------------- */
 /*
@@ -96,8 +110,10 @@ const size_t kMemorySize = (64ull << 20);
 #define first(b)     ((b)->fd)
 #define last(b)      ((b)->bk)
 
-#define is_empty(b) (first(b) == (b))
-#define has_one(b)  (first(b) == last(b))
+/* #define is_empty(b) (first(b) == (b)) */
+#define is_empty(b) ((b) == NULL)
+#define has_one(b)  ((b) != NULL && first(b) == (b))
+#define has_two(b)  ((b) != NULL && first(b) == last(b))
 
 /*
   Binmap
@@ -172,12 +188,6 @@ int malloc_initialized = -1;
  */
 
 /* -------------------- Heap and chunk manupilation  ------------------ */
-inline static void prepare_block(blkptr blk)
-{
-  blk->fd = blk->bk = NULL;
-  blk = blk + 1;
-}
-
 /* See the above diagram for where these two fenceposts are positions */
 static void init_fps_top(blkptr init_hh, mstate mst)
 {
@@ -249,7 +259,7 @@ static blkptr init_heap(void)
   init_fps_top(heap, mst);
 
   /* Init bins and place the initial chunk in the largest bin */
-  init_bins(mst);
+  /* init_bins(mst); */
 
   /* Init bin map */
   mst->binmap = 0;
@@ -335,13 +345,20 @@ static blkptr split_block(blkptr blk, size_t asize)
 static blkptr __alloc_from_bin(mstate m, int bidx)
 {
   blkptr bin = bin_at(m, bidx);
+
+  assert(bin != NULL);
+
   blkptr fblk;
 
   if (has_one(bin)) {           /* only one free block */
-    fblk = bin->fd;
+    fblk = bin;
+    /* unlink */
+    bin = NULL;
+  } else if (has_two(bin)) {    /* 2 free blocks */
+    fblk = bin->bk;
     /* unlink */
     bin->fd = bin->bk = bin;
-  } else {                      /* 2 or more free blocks */
+  } else {                      /* 3 or more free blocks */
     fblk = bin->bk;
     /* unlink */
     bin->bk = bin->bk->bk;
@@ -349,20 +366,28 @@ static blkptr __alloc_from_bin(mstate m, int bidx)
   }
 
   set_block_inuse(fblk);
+  set_block_foot(fblk)
 
   return fblk;
 }
 
-static blkptr __alloc_from_top(mstate m, size_t sz)
+/* `sz` is total size for the to-be-allocated block, including both
+   the free size returned to user and the overhead (tags)   */
+static blkptr __alloc_from_top(mstate m, size_t tsz)
 {
   blkptr mblk = m->top;
-  mblk = (blkptr) ((char *)mblk - sz + kMetadataSize);
-  set_block_size(mblk, sz);
-  set_block_inuse(mblk);
-  /* TODO: zero the free block? */
 
-  m->top = mblk - 1;
-  update_remainder(m, m->remainder - sz);
+  mblk = (blkptr) ((char *)mblk - tsz);
+
+  set_block_size(mblk, tsz);
+  set_block_inuse(mblk);
+
+  set_block_foot(mblk)
+
+  prepare_allocblk(mblk);
+
+  update_top(m, mblk);
+  update_remainder(m, m->remainder - tsz);
 
   return mblk;
 }
@@ -426,7 +451,7 @@ void* my_malloc(size_t size)
 
   /* 1. align requested size to multiple of 8 */
   size_t blk_asize = req2size(size);
-  size_t total_asz = blk_asize + kMetadataSize;
+  size_t total_asz = blk_asize + TAGS_SIZE;
 
   /* 2. determin size class list */
   int bidx = bin_index(blk_asize);
@@ -446,7 +471,7 @@ void* my_malloc(size_t size)
     heap = __alloc_from_bin(mst, bidx);
   }
   else if (checked_top(mst, total_asz)) {
-    heap = __alloc_from_top(mst, total_asz);
+    return __alloc_from_top(mst, total_asz);
   }
   else {
     /* search for the next larger non-empty first */
@@ -463,7 +488,8 @@ void* my_malloc(size_t size)
   }
 
   /* 4. allocate */
-  prepare_block(heap);
+  /* FIXME: update top only after heap has been fixed */
+
   return heap;
 
 }
@@ -476,7 +502,7 @@ void my_free(void *ptr) {
 int main(int argc, char* argv[])
 {
 
-  int* fib = my_malloc(173); /* aligned to 176 */
+  int* fib = my_malloc(173); /* aligned to 192 (3 padding + 16 boundary tags) */
 
   printf("Allocated heap start = %p\n", fib);
 
