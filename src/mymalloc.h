@@ -26,14 +26,17 @@ typedef unsigned long uint32;
 typedef unsigned long long uint64;
 
 struct Block {
-  size_t size;                  /* chunk size, including overhead */
-  Block *fd;                    /* forward  */
-  Block *bk;                    /* backward */
+  size_t size;        /* chunk size, including overhead */
+  size_t mindex;      /* index of malloc heap this block belongs to */
+  Block *fd;          /* forward ptr, only for free blocks */
+  Block *bk;          /* backward ptr, only for free blocks*/
 };
 
 /* internal state */
 struct malloc_state;
+struct _heap_info;
 typedef struct malloc_state *mstate;
+typedef struct _heap_info *hinfo;
 
 // Word alignment
 extern const size_t kAlignment;

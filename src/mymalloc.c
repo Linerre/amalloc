@@ -14,29 +14,47 @@ const size_t kMemorySize = (64ull << 20);
 
 /* ------------------ Size and alignment checks ------------------ */
 #define ALIGN_MASK     (kAlignment - 1)
-#define TAGS_SIZE      (kMetadataSize - kAlignment)
 
 /* The smallest possible block with overhead */
-#define MIN_BLOCK_SIZE (kMetadataSize + kMinAllocationSize + kAlignment)
+#define MIN_BLOCK_SIZE (kMetadataSize + kAlignment)
 
 /* The smallest aligned size that can be malloced  */
 #define MINSIZE        ((MIN_BLOCK_SIZE + ALIGN_MASK) & ~ALIGN_MASK)
 
+/* The size that free block overlaps with its malloc counterpart */
+#define OVERLAP_SZ     ((size_t) 24)
+
+/* Ceil requested size to the nearest multiples of 64MB for
+   initialization.  Given the specs, this should result either 64MB or
+   128MB */
+#define ceilreq(req) \
+(((req) + kMemorySize - (size_t) 1) / kMemorySize * kMemorySize)
+
 /* Round up the requested size to multiple of word size */
-#define req2size(req)          (((req) + ALIGN_MASK) & ~ALIGN_MASK)
-/* #define checked_req2size(req)  (((req) + ALIGN_MASK) & ~ALIGN_MASK) */
+#define req2asize(req)  (((req) + ALIGN_MASK) & ~ALIGN_MASK)
+
+/* Like above, but use aligned size calcute the total size to allocate */
+#define asz2tsize(asz) \
+ ((asz) <= MINSIZE ? MINSIZE : (asz) + MINSIZE - OVERLAP_SZ)
 
 /* ------------------ Heap block operations  ------------------ */
-/* size field is OR'ed with this flag when previous adjacent block in use */
+/* Size field is OR'ed with this flag when previous adjacent block in use */
 #define PREV_INUSE 0x1
+
+/* Footer size for free blocks */
 #define FTR_SZ     ((size_t) 8)
-#define HDR_SZ     ((size_t) 8)
+
+/* Header size for allocated blocks */
+#define HDR_SZ     ((size_t) 8 * 2)
 
 /* Get block size (payload + overhead), ignoring PREV_INUSE bit */
 #define blocksize(b)         ((b)->size & ~ALIGN_MASK)
 
 /* Like blocksize, but contains the PREV_INUSE bit */
 #define blocksize_nomask(b)  ((b)->size)
+
+/* Like blocksize, but excludes head and index size */
+#define blocksize_nohead(b)  ((b)->size - HDR_SZ)
 
 #define set_size(b, sz) ((b)->size = (sz))
 
@@ -76,13 +94,16 @@ const size_t kMemorySize = (64ull << 20);
 #define unset_inuse(b) \
   ((blkptr) (((char *) (b)) + blocksize(b)))->size &= ~(PREV_INUSE)
 
-/* Move block metadata pointer to the start of usable memory */
-#define set_block_memp(b) \
-  ((b) = (blkptr) ((char *)b + kAlignment))
+/* Move block pointer to the start of usable memory */
+#define set_memp(b) \
+  ((b) = (blkptr) ((char *)b + HDR_SZ))
 
-/* Move usable memory pointer to the start of block metadata */
-#define unset_block_memp(b) \
-  ((b) = (blkptr) ((char *)b - kAlignment))
+/* Move block pointer to the start of metadata */
+#define unset_memp(b) \
+  ((b) = (blkptr) ((char *)b - HDR_SZ))
+
+/* Set block index to the curret malloc_state it belongs to */
+#define set_mindex(b, i) ((b)->mindex = (i))
 
 #define inc_remainder(m, sz) ((m)->remainder += (sz))
 #define dec_remainder(m, sz) ((m)->remainder -= (sz))
@@ -92,8 +113,8 @@ const size_t kMemorySize = (64ull << 20);
 #define fd_top(m, b, sz)  ((m)->top = (blkptr)((char *)(b) + sz))
 #define bk_top(m, b, sz)  ((m)->top = (blkptr)((char *)(b) - sz))
 
-#define at_lfp(m)    ((char *) ((m)->lfp) + kMetadataSize)
-#define at_hfp(m)    ((char *) ((m)->hfp))
+#define at_lfp(m)    ((blkptr) ((char *) ((m)->lfp) + HDR_SZ))
+#define at_hfp(m)    ((m)->hfp)
 
 /* Check if current block is at any of the fenceposts */
 #define next_to_lfp(m, b)    (b == ((m)->lfp + 1))
@@ -101,7 +122,7 @@ const size_t kMemorySize = (64ull << 20);
 
 /* Check if `top' would hit the highest boundary (hfp) */
 #define checked_top(m, sz) \
-  (((char *)((m)->top) + (sz)) <= at_hfp(m))
+  ((blkptr) ((char *)((m)->top) + (sz)) <= at_hfp(m))
 
 /* Check next block is top */
 #define next_top(m, b)  (block_at_offset(b, blocksize(b)) == (m)->top)
@@ -118,11 +139,11 @@ const size_t kMemorySize = (64ull << 20);
   -----------------------------------------------------------------
   lists in bin          spaced   Order                 Range (byte)
   -----------------------------------------------------------------
-  32 bins of size            8   FIFO                    8 -   256
-  16 bins of size           64   FIFO                  257 -  1280
-   8 bins of size          512   FIFO                 1281 -  5376
-   2 bins of size         4096   FIFO                 5377 - 13568
-   1 bins of size  what's left   kept in size order  13568+
+  32 bins                    8   FIFO                    1 -   256
+  16 bins                   64   FIFO                  257 -  1280
+   8 bins                  512   FIFO                 1281 -  5376
+   2 bins                 4096   FIFO                 5377 - 13568
+   1 bins          what's left   kept in size order  13568+
   -----------------------------------------------------------------
 
   Macros for computing bin indices assume arg `sz' to be of type `size_t'.
@@ -135,13 +156,14 @@ const size_t kMemorySize = (64ull << 20);
 #define NSMALLBINS     32
 /* Spaced 8 bytes apart  */
 #define SMALLBIN_SPACE 8
-/* Handles size ranging from 8 (min) to 256 (max) */
+/* Handles size ranging from 32 (min) to 256 (max) */
 #define MAX_SMALL_SIZE (NSMALLBINS * SMALLBIN_SPACE)
 
 #define in_smallbin_range(sz) \
   ((sz) < (size_t) MAX_SMALL_SIZE)
 
 #define smallbin_index(sz) ((sz) >> 3)
+#define smallbin_index_64(sz) ((((sz) - OVERLAP_SZ ) >> 3) + 1)
 
 #define largebin_index(sz) \
   (((((sz) - MAX_SMALL_SIZE) >> 6) < 16) ? 32 + (((sz) - MAX_SMALL_SIZE) >> 6) :\
@@ -174,15 +196,13 @@ const size_t kMemorySize = (64ull << 20);
   Binmap
 
   To help compensate for the large number of bins, a one-level index
-  structure is used for bin-by-bin searching.  `binmap' is a
-  bitvector recording whether bins are definitely empty so they can
-  be skipped over during during traversals.  The bits are NOT always
-  cleared as soon as bins are empty, but instead only when they are
-  noticed to be empty during traversal in malloc.
+  structure is used for bin-by-bin searching.  `binmap' is a bitvector
+  recording whether bins are definitely empty so they can be skipped
+  over during during traversals.  The bits cleared as soon as bins are
+  empty.
  */
 #define BINMAPSHIFT    6
 #define BINMAPSIZE     2
-#define BITSPERMAP     32
 
 /* Decide index bit  */
 #define idx2bit(i)  (1ULL << (((uint64)(i) & ((1ULL << BINMAPSHIFT) - 1))))
@@ -192,61 +212,59 @@ const size_t kMemorySize = (64ull << 20);
 #define get_binmap(m, i)    ((m)->binmap & idx2bit(i))
 
 /* ------------------- Internal state representation ------------------- */
-
 /*
-  Global, file-local state for this mallocator implementation.  The state
-  tracks information that the allocator should be aware of before some time
-  consuming operations (such as coalesing, mmap and splitting) so that it
-  can be as lazy as possible.
+  heap_info represents the state of each mmap chunk (64MB or 128MB)
+  acquired from OS.  This state is put at the start of the chunk and
+  followed immediately by the leftmost fencepost.  See the memory
+  layout diagram below.
+
+  mmap chunk memory layout
+
+  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	|state| allocated chunks  |           free chunks           |tfp|
+	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+        ^                   ^                                 ^
+        low fence          top                             high fence
+
+  At first, all bins are empty. `top' points to the begining of first
+  free area of the chunk.  Memory in this free area has not been split
+  or put into any bins.  Thus, `top' represents its own special bin
+  that is _not_ in the bins list.  `top' moves towards right (to
+  higher addr) while allocating until it hits hfp.
  */
-static struct malloc_state {
 
-  /* Top makrs the end (highest) addr just before the `hfp' below */
-  blkptr top;
+struct malloc_state {
+  blkptr top;         /* start of free block in the entire chunk */
+  blkptr lfp;         /* low fencepost, after state and before top */
+  blkptr hfp;         /* high fencepost, marks end of the chunk */
+  blkptr bins[NBINS]; /* see bin comments above; bin[0] does not exist */
+  size_t remainder;   /* available space of this chunk */
+  uint64 binmap;      /* 64-bit bitvector to track bins status */
+  uint64 mindex;      /* index of current heap */
+};
 
-  /* low fencepost, as start of the 64MB heap */
-  blkptr lfp;
+#define MSTATE_SZ     (sizeof(struct malloc_state))
+#define MAX_STATES    100
 
-  /* high fencepost, as end of the 64MB heap */
-  blkptr hfp;
-
-  /* list of bins or size classes */
-  blkptr bins[NBINS];
-
-  /* the remaining, allocable space */
-  size_t remainder;
-
-  /* 64-bit bitmap for bin indices: effect index starts with 1 */
-  uint64 binmap;
-} mmstate;
+/* The global, file-local state for all mmap-ed chunks from OS. */
+static struct _heap_info {
+  mstate states[MAX_STATES]; /* list of malloc_states; states[0] not exist */
+  mstate current;            /* current mmap chunk */
+  size_t tmsize;             /* total size of all mmaped chunks */
+  uint32 tmnum;              /* total number of all mmap chunks */
+} heap_info;
 
 int malloc_initialized = -1;
 
-/*
-  Heap memory layout
 
-  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-	|lfp| allocated chunks  |   free chunks                     |tfp|
-	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-  ^                       ^                                   ^
-  low fence               top                             high fence
-
-  At first, all bins are empty except that each bin has a `Block' head
-  that points to itself to initialize a circular doudly link list.
-
-  `top' points to the addr immediately after lfp at init stage and moves
-  towards right (to higher addr) while allocating until it hits hfp.
-
-
- */
 
 /*  ---------- Heap, chunk, internal state manupilation  ---------- */
 
-/*  */
-static void* sysmmap(mstate m)
+/* Request multiple of 64MB from OS */
+static void* sysmmap(size_t csz)
 {
   void* mem = mmap(NULL,                        /* let kernel decide */
-                   kMemorySize,                 /* 64MB at a time    */
+                   csz,                         /* multiple of 64MB but <= 128 */
                    PROT_READ | PROT_WRITE,      /* prot              */
                    MAP_PRIVATE | MAP_ANONYMOUS, /* flags             */
                    0,                           /* fd                */
@@ -261,49 +279,54 @@ static void* sysmmap(mstate m)
   return mem;
 }
 
-
-/* See the above diagram for positions of these two fenceposts  */
-static void init_fps_top(blkptr init_hh, mstate ms)
+/* Set up malloc_state for a given mmap chunk */
+static void __init_malloc_state(mstate m, size_t csz)
 {
+  hinfo h = &heap_info;
 
-  size_t rsz = kMemorySize - kMetadataSize;
-  blkptr dm_start = init_hh;
-  dm_start->size = 1;          /* memory beyond leftmost alwasy in use */
-  dm_start->fd = init_hh + 1;
-  dm_start->bk = NULL;
-  ms->lfp = dm_start;
+  /* register this mstate in global heap info */
+  h->tmsize += csz;
+  h->tmnum += 1;
+  h->states[h->tmnum] = m;
+  h->current = m;
 
-  /* TODO: make this a macro */
-  blkptr dm_end = (blkptr) ((char*)init_hh + rsz);
-  dm_end->size = 0;             /* memory < rightmost always free at start */
-  dm_end->fd = NULL;
-  dm_end->bk = dm_end - 1;
-  ms->hfp = dm_end;
+  /* init mindex and binmap */
+  m->mindex = h->tmnum;
+  m->binmap = 0;
 
-  /* Update top */
-  ms->top = dm_start + 1;
-  rsz -= kMetadataSize;
-  set_size(ms->top, rsz);
+  /* init bins */
+  size_t i;
+  size_t t = N_LISTS + 1;
+  for (i = 0; i < t; i++)
+    m->bins[i] = NULL;
 
-  set_remainder(ms, rsz);
+
+  /* init lfp, hfp, and top.  Note: fenceposts are shrinked to have
+     `size' and `mindex' fields only to save space  */
+  m->lfp = (blkptr) ((char *)m + MSTATE_SZ);
+  m->lfp->mindex = m->mindex;
+  m->top = (blkptr) ((char *)m->lfp + HDR_SZ) ;
+  m->hfp = (blkptr) ((char *)m + csz - HDR_SZ);
+  m->hfp->mindex = m->mindex;
+
+  /* init other fields */
+  m->remainder = csz - MSTATE_SZ - HDR_SZ * 2;
+
 }
 
 /*
-  Initialize the `heap', which is the memory chunk totaling 64MB
-  to be used for future allocations unless it can no longer satisfiy
+  Initialize the `heap', which is the memory chunk totaling ceiled
+  size, to be used for future allocations unless it can no longer
+  satisfiy
  */
-static blkptr init_heap(mstate m)
+static blkptr init_malloc(size_t csz)
 {
-  blkptr heap = sysmmap(m);
+  mstate m = sysmmap(csz);
 
-  if (heap == NULL)
+  if (m == NULL)
     return NULL;
 
-  /* Set fenceposts at both start and end of the heap */
-  init_fps_top(heap, m);
-
-  /* Init bin map */
-  m->binmap = 0;
+  __init_malloc_state(m, csz);
 
   /* Mark initialization */
   malloc_initialized = 0;
@@ -337,9 +360,8 @@ int find_next_nonempty_bin(mstate m, int bidx) {
 /* Normal bins are those that belong to bins 1-58 (i.e. not in the
    last bin).  These bins are circular doubly linked lists that act
    in a FIFO mannar: inserting at heap and taking from tail. */
-static void __insert_normal_bins(int bidx, blkptr mblk)
+static void __insert_normal_bins(mstate m, blkptr mblk, int bidx)
 {
-  mstate m = &mmstate;
   blkptr bin = bin_at(m, bidx);
 
   if (is_empty(bin)){
@@ -350,7 +372,6 @@ static void __insert_normal_bins(int bidx, blkptr mblk)
   } else if (has_one(bin)) {    /* 1 free blocks only */
     mblk->fd = bin;
     mblk->bk = bin;
-    bin->fd = mblk;
     bin->bk = mblk;
     bin = mblk;
   } else {                      /* 2 or more free blocks */
@@ -364,9 +385,8 @@ static void __insert_normal_bins(int bidx, blkptr mblk)
 
 /* Blocks in the last bins are arranged according their sizes, from
    small to large, to meet the best-fit requirement. */
-static void __insert_last_bin(blkptr mblk)
+static void __insert_last_bin(mstate m, blkptr mblk)
 {
-  mstate m = &mmstate;
   blkptr bin = bin_at(m, N_LISTS);
   size_t blksz = blocksize(mblk);
 
@@ -418,18 +438,18 @@ static void __insert_last_bin(blkptr mblk)
 }
 
 /* Insert a free block at head of the given bin */
-static void insert_into_bin(int bidx, blkptr mblk) {
+static void insert_into_bin(mstate m, blkptr mblk, int bidx) {
 
   if (bidx == N_LISTS)
-    __insert_last_bin(mblk);
+    __insert_last_bin(m, mblk);
   else
-    __insert_normal_bins(bidx, mblk);
+    __insert_normal_bins(m, mblk, bidx);
 }
 
 /* Split the larger `blk' at higher addr end and return the rightmost
    part for malloc, putting remaining left (low-addr) part back to a
    suitable bin. */
-static blkptr split_block(blkptr blk, size_t asize)
+static blkptr split_block(mstate m, blkptr blk, size_t asize)
 {
   size_t blk_sz =  blocksize(blk);
   size_t need_sz = asize + kMetadataSize;
@@ -440,8 +460,11 @@ static blkptr split_block(blkptr blk, size_t asize)
   if (left_sz >= MINSIZE) {         /* remainder allocable on its own */
     /* take the right block */
     rblk = block_at_offset(blk, left_sz);
-    /* this also unsets PREV_INUSE for left blcok */
+    /* this also unsets PREV_INUSE for left blcok.  No need to set
+       index as blocks in bins (except top) should already have
+       correct index */
     set_size(rblk, need_sz);
+
 
     /* set PREV_INUSE in next block at header and footer */
     set_inuse(rblk);
@@ -450,9 +473,9 @@ static blkptr split_block(blkptr blk, size_t asize)
 
     /* collect the left block (a pun!) */
     set_head_size(lblk, left_sz);
-    insert_into_bin(bin_index(left_sz), lblk);
+    insert_into_bin(m, lblk, bin_index(left_sz));
 
-    set_block_memp(rblk);
+    set_memp(rblk);
     return rblk;
   } else {                      /* remainder allocated as well */
     /* set PREV_INUSE in next block at header and footer */
@@ -460,7 +483,7 @@ static blkptr split_block(blkptr blk, size_t asize)
     blkptr nextblk = block_at_offset(lblk, blk_sz);
     set_foot(nextblk, blocksize(nextblk), blocksize_nomask(nextblk));
 
-    set_block_memp(lblk);
+    set_memp(lblk);
 
     return lblk;
   }
@@ -493,6 +516,7 @@ static blkptr __alloc_from_bin(mstate m, int bidx)
     bin->bk->fd = bin;
   }
 
+  set_mindex(mblk, m->mindex);
   set_inuse(mblk);
 
   /* set the next block footer too */
@@ -505,7 +529,7 @@ static blkptr __alloc_from_bin(mstate m, int bidx)
 }
 
 /* `tsz` is total size for the to-be-allocated block, including both
-   the usable size requested and overhead (2 boundary tags) */
+   the usable size requested and overhead (size + mindex) */
 static blkptr __alloc_from_top(mstate m, size_t tsz)
 {
   blkptr mblk = m->top;
@@ -514,10 +538,11 @@ static blkptr __alloc_from_top(mstate m, size_t tsz)
 
   /* set size for alloc */
   set_size(mblk, tsz);
+  set_mindex(mblk, m->mindex);
 
   /* set up new top */
   fd_top(m, mblk, tsz);
-  set_head_size(m->top, rsz);
+  set_size(m->top, rsz);
 
   /* set PREV_INUSE for new top at header and footer */
   set_inuse(mblk);
@@ -526,7 +551,7 @@ static blkptr __alloc_from_top(mstate m, size_t tsz)
   /* sub alloc size from remainder */
   dec_remainder(m, tsz);
 
-  set_block_memp(mblk);
+  set_memp(mblk);
 
   return mblk;
 }
@@ -541,14 +566,14 @@ static blkptr __try_alloc_from_next(mstate m, int bidx, size_t basize)
 
   if (nbidx > 0) {
     blkptr mblk = bin_at(m, nbidx);
-    return split_block(mblk, basize);
+    return split_block(m, mblk, basize);
   }
 
   return NULL;
 }
 
 
-static void __merge_with_next(blkptr mblk, blkptr nextblk)
+static void __merge_with_next(mstate m, blkptr mblk, blkptr nextblk)
 {
   size_t new_sz = blocksize(mblk) + blocksize(nextblk);
   set_head(mblk, new_sz);
@@ -559,10 +584,10 @@ static void __merge_with_next(blkptr mblk, blkptr nextblk)
   unset_inuse(mblk);
 
   int new_bidx = bin_index(new_sz);
-  insert_into_bin(new_bidx, mblk);
+  insert_into_bin(m, mblk, new_bidx);
 }
 
-static void __merge_with_prev(blkptr mblk, blkptr prevblk)
+static void __merge_with_prev(mstate m, blkptr mblk, blkptr prevblk)
 {
   size_t new_sz = blocksize(prevblk) + blocksize(mblk);
   set_head(prevblk, new_sz);
@@ -571,10 +596,10 @@ static void __merge_with_prev(blkptr mblk, blkptr prevblk)
   unset_inuse(mblk);
 
   int new_bidx = bin_index(new_sz);
-  insert_into_bin(new_bidx, prevblk);
+  insert_into_bin(m, prevblk, new_bidx);
 }
 
-static void __merge_with_both(blkptr mblk, blkptr nextblk)
+static void __merge_with_both(mstate m, blkptr mblk, blkptr nextblk)
 {
   blkptr prevblk = prev_block(mblk);
   size_t new_sz = blocksize(prevblk) + blocksize(mblk) + blocksize(nextblk);
@@ -584,7 +609,7 @@ static void __merge_with_both(blkptr mblk, blkptr nextblk)
   unset_inuse(nextblk);
 
   int new_bidx = bin_index(new_sz);
-  insert_into_bin(new_bidx, prevblk);
+  insert_into_bin(m, prevblk, new_bidx);
 }
 
 static void coalesce(mstate m, blkptr mblk, int bidx)
@@ -592,7 +617,7 @@ static void coalesce(mstate m, blkptr mblk, int bidx)
   blkptr nextblk = next_block(mblk);
 
   if (prev_inuse(mblk) && next_inuse(nextblk)) {       /* case 1 */
-    insert_into_bin(bidx, mblk);
+    insert_into_bin(m, mblk, bidx);
   }
 
   else if (prev_inuse(mblk) && !next_inuse(nextblk)) { /* case 2 */
@@ -601,10 +626,10 @@ static void coalesce(mstate m, blkptr mblk, int bidx)
        otherwise merge with the next (right) block
      */
     if (next_to_hfp(m, nextblk))
-      insert_into_bin(bidx, mblk);
+      insert_into_bin(m, mblk, bidx);
 
     else
-      __merge_with_next(mblk, nextblk);
+      __merge_with_next(m, mblk, nextblk);
   }
 
   else if (!prev_inuse(mblk) && next_inuse(nextblk)) { /* case 3 */
@@ -614,14 +639,14 @@ static void coalesce(mstate m, blkptr mblk, int bidx)
      */
     blkptr prevblk = prev_block(mblk);
     if (next_to_lfp(m, prevblk))
-      insert_into_bin(bidx, mblk);
+      insert_into_bin(m, mblk, bidx);
 
     else
-      __merge_with_prev(mblk, prevblk);
+      __merge_with_prev(m, prevblk, mblk);
   }
 
   else  {                                              /* case 4 */
-    __merge_with_both(mblk, nextblk);
+    __merge_with_both(m, nextblk, mblk);
   }
 }
 
@@ -662,48 +687,42 @@ blkptr ptr_to_block(void *ptr) {
 /* ----------------- Core malloc/free functions ----------------- */
 /*
   `size' is user requested when calling this allocator. For a single
-  call of this function each time, word_size <= size <= 128MB;
+  call of this function each time, 1B <= size <= 128MB;
  */
 void* my_malloc(size_t size)
 {
-  /* FIXME: handle size >= kMaxAllocationSize */
-  if (size <= 0) {
-    LOG("Cannot allocate size <= 0\n");
+  if (size == 0 || size > kMaxAllocationSize) {
+    LOG("Cannot allocate size <= 0 or size > 128MB\n");
     return NULL;
   }
 
-
-  blkptr heap;
-  mstate m = &mmstate;
+  hinfo h = &heap_info;         /* global heap info */
+  mstate m;                     /* current malloc state */
+  blkptr top;                   /* current malloc block top */
+  blkptr mblk;                  /* block for allocation */
 
   if (malloc_initialized < 0) {
-    heap = init_heap(m);
+    top = init_malloc(ceilreq(size));
 
-    if (heap == NULL)
+    if (top == NULL)
       return NULL;
   }
-  else
-    heap = m->top;
 
+  if (h->current == NULL) {
+    LOG("Invalid malloc state\n");
+    return NULL;
+  }
 
-  /* 1. align requested size to multiple of 8 */
-  size_t basize = req2size(size);
-  size_t total_asz = basize + TAGS_SIZE;
+  m = h->current;
+  /* redaundant but harmless */
+  top = m->top;
+
+  /* 1. align requested size to multiple of 8 and check for minsize */
+  size_t blk_asz = req2asize(size);
+  size_t total_asz = asz2tsize(blk_asz);
 
   /* 2. determin size class list */
-  int bidx = bin_index(basize);
-
-  /*
-    Searching for a suitable block
-    if match-bin-non-empty
-      allocate from bin
-    else if top has space
-      allocate from top
-    else
-      1. try search next larger bins and if failed, then
-      2. try coalecing then and if failed, then
-      3. request new huge chunck via mmap
-   */
+  int bidx = bin_index(blk_asz);
 
   if (get_binmap(m, bidx)) {
     return __alloc_from_bin(m, bidx);
@@ -713,22 +732,22 @@ void* my_malloc(size_t size)
   }
   else {
     /* try to alloc from the next larger non-empty  */
-    heap =  __try_alloc_from_next(m, bidx, basize);
+    mblk =  __try_alloc_from_next(m, bidx, blk_asz);
 
     /* FIXME: perhaps scanning the entire heap and collect any free
        blocks would be the last hope before new mmap.  This is garbage
        collection feature yet to be implemented */
-    if (heap == NULL) {
+    if (mblk == NULL) {
       /* TODO: multiple syscalls */
 
     }
 
-    dec_remainder(m, blocksize(heap));
+    dec_remainder(m, blocksize(mblk));
 
   }
 
   /* 4. allocate */
-  return heap;
+  return mblk;
 
 }
 
@@ -739,45 +758,41 @@ void my_free(void *ptr) {
     return;
   }
 
-  mstate m = &mmstate;
-  /* TODO: make these a macro */
-  if ((blkptr) ptr < m->lfp || (blkptr) ptr > m->hfp) {
-    LOG("Given addr not in the valid range.\n")
+
+  hinfo h = &heap_info;         /* global heap info */
+  mstate m;                     /* malloc state for this free */
+  blkptr mblk = (blkptr) ptr;   /* cast to block pointer */
+
+  unset_memp(mblk);             /* restore malloc block head position */
+  uint64 midx = mblk->mindex;   /* block's memory scope */
+
+  if (h->states[midx] == NULL) {
+    LOG("Free failed: invalid block index: %llu.\n", midx);
     return;
   }
 
-  /*
-    1. cast ptr to blkptr
-    2. update tags/flags properly
-    3. use size to get bin index
-    4. put blk back to corresponding bin
-       if bin index == N_LISTS
-         chunks ordered in size
-       else
-         insert at head
+  /* Check out the correct malloc_state */
+  m = h->states[midx];
 
-    Coalescing when freeing
+  /* In case user modifies the block index by mistake or intentionally */
+  if (mblk < at_lfp(m) || mblk > at_hfp(m)) {
+    LOG("Free failed: block address not in valid range.\n")
+    return;
+  }
 
-    if small bin block, insert into suitable bin
-    if medium or larger, try coalescing first
-      if succeed, insert into suitable bin
-      else quit coalescing and insert the blcok to bin
-
-   */
-
-  blkptr mblk = (blkptr) ptr;
-  unset_block_memp(mblk);
+  /* TODO: Check double free and fail accordingly */
 
   unset_inuse(mblk);
+  /* TODO: unset foot of next chunk */
 
   size_t blksz = blocksize(mblk);
   inc_remainder(m, blksz);
 
-  int bidx = bin_index(blksz);
+  int bidx = bin_index(blocksize_nohead(mblk));
 
   /* insert small blcoks to small bins */
   if (in_smallbin_range(blksz))
-    insert_into_bin(bidx, mblk);
+    insert_into_bin(m, mblk, bidx);
 
   else
     coalesce(m, mblk, bidx);
@@ -787,24 +802,27 @@ void my_free(void *ptr) {
 int main(int argc, char* argv[])
 {
 
-  uint32 j;
-  for (j = 4; j <= 20; j++) {
-    int* fib = (int *) my_malloc(1UL << j);
+  /* Test small */
+  int* fib = (int *) my_malloc(253);
 
-    assert(fib != NULL);
+  assert(fib != NULL);
 
-    uint32 i;
-    fib[0] = 0;
-    fib[1] = 1;
-    for (i = 2; i < j; i++)
-      fib[i] = fib[i-1] + fib[i-2];
-
-
-    my_free(fib);
-  }
+  my_free(fib);
 
   /* Test medium */
+  int* fib2 = (int *) my_malloc(4011);
+
+  assert(fib2 != NULL);
+
+  my_free(fib2);
 
   /* Test large */
+  int* fib3 = (int *) my_malloc(1UL << 20);
+
+  assert(fib3 != NULL);
+
+  my_free(fib3);
+
+
   return 0;
 }
