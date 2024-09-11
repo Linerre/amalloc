@@ -28,13 +28,20 @@ const size_t kMemorySize = (64ull << 20);
 
 /* ------------------ Heap block operations  ------------------ */
 #define CURR_INUSE 0x1
-#define PREV_INUSE 0x2
 #define SIZE_FLAGS (CURR_INUSE | PREV_INUSE)
 
-/* Extract payload + overhead  */
-#define blocksize(b)         ((b)->size & ~7)
+/* size field is OR'ed with this flag when previous adjacent block in use */
+#define PREV_INUSE 0x1
+#define FTR_SZ     ((size_t) 8)
+#define HDR_SZ     ((size_t) 8)
 
-#define set_block_size(b, sz) ((b)->size = (sz))
+/* Get block size (payload + overhead), ignoring PREV_INUSE bit */
+#define blocksize(b)         ((b)->size & ~ALIGN_MASK)
+
+/* Like blocksize, but contains the PREV_INUSE bit */
+#define blocksize_nomask(b)  ((b)->size)
+
+#define set_size(b, sz) ((b)->size = (sz))
 
 /* Set and unset the flags */
 #define set_block_inuse(b)    ((b)->size |= CURR_INUSE)
@@ -42,17 +49,45 @@ const size_t kMemorySize = (64ull << 20);
 #define set_prevb_inuse(b)    ((b)->size |= PREV_INUSE)
 #define set_prevb_free(b)     ((b)->size &= ~PREV_INUSE)
 
-/* Move block pointer to the start of usable memory */
-#define set_block_mem(b) \
+/* Set size at head, without disturbing its use bit */
+#define set_head_size(b, s)   ((b)->size = (((b)->size & PREV_INUSE) | (s)))
+
+/* Set size/use field at the same time */
+#define set_head(b, s)  ((b)->size = (s))
+
+/* Set size based on off for footer (used only for free blocks) */
+#define set_foot(b, off, sz) \
+  (((blkptr) ((char *) (b) + ((off) - FTR_SZ)))->size = (sz))
+
+/* Treat space at ptr + offset as a block */
+#define block_at_offset(b, s)  ((blkptr) (((char *) (b)) + (s)))
+
+/* extract b's inuse bit */
+#define inuse(b) \
+  ((((blkptr) (((char *) (b)) + blocksize(b)))->size) & PREV_INUSE)
+
+/* set/clear block as being inuse without otherwise disturbing */
+#define set_inuse(b) \
+  ((blkptr) (((char *) (b)) + blocksize(b)))->size |= PREV_INUSE
+
+#define unset_inuse(b) \
+  ((blkptr) (((char *) (b)) + blocksize(b)))->size &= ~(PREV_INUSE)
+
+/* Move block metadata pointer to the start of usable memory */
+#define set_block_memp(b) \
   ((b) = (blkptr) ((char *)b + kAlignment))
 
-/* Move block pointer to the start of block */
-#define unset_block_mem(b) \
+/* Move usable memory pointer to the start of block metadata */
+#define unset_block_memp(b) \
   ((b) = (blkptr) ((char *)b - kAlignment))
 
-#define update_remainder(m, sz)  ((m)->remainder = (sz))
+#define inc_remainder(m, sz) ((m)->remainder += (sz))
+#define dec_remainder(m, sz) ((m)->remainder -= (sz))
+#define set_remainder(m, sz) ((m)->remainder = (sz))
 
-#define update_top(m, b, sz)  ((m)->top = (blkptr)((char *)(b) + sz))
+/* Move top forward (to higher addr) or backward (to lower addr) */
+#define fd_top(m, b, sz)  ((m)->top = (blkptr)((char *)(b) + sz))
+#define bk_top(m, b, sz)  ((m)->top = (blkptr)((char *)(b) - sz))
 
 #define at_lfp(m)    ((char *) ((m)->lfp) + kMetadataSize)
 #define at_hfp(m)    ((char *) ((m)->hfp))
@@ -108,8 +143,13 @@ const size_t kMemorySize = (64ull << 20);
   ((in_smallbin_range(sz)) ? smallbin_index(sz) : largebin_index(sz))
 
 /* bin_at(0) does not exist */
-#define bin_at(m, i)      ((m)->bins[i])
-#define init_bin(m, i, b) ((m)->bins[i] = (b))
+#define bin_at(m, i)           ((m)->bins[i])
+#define init_bin(m, i, b)      ((m)->bins[i] = (b))
+
+/* set head of bin at i to b*/
+#define set_bin_head(m, i, b)  ((m)->bins[i] = b)
+/* set bin head to NULL */
+#define nil_bin_head(m, i)     ((m)->bins[i] = NULL)
 
 /* Reminders about list directionality within bins */
 #define first(b)     ((b)->fd)
@@ -191,27 +231,20 @@ int malloc_initialized = -1;
  */
 
 /* -------------------- Heap and chunk manupilation  ------------------ */
-static void set_block_foot(blkptr blk)
-{
-  size_t sz = blocksize(blk);
-  size_t *ft = (size_t *) ((char *)blk + sz - kAlignment);
-  *ft = (sz |= CURR_INUSE);
-}
-
 /* See the above diagram for positions of these two fenceposts  */
 static void init_fps_top(blkptr init_hh, mstate ms)
 {
 
   size_t rsz = kMemorySize - kMetadataSize;
   blkptr dm_start = init_hh;
-  dm_start->size = 1;          /* 1 means initialized */
+  dm_start->size = 1;          /* memory beyond leftmost alwasy in use */
   dm_start->fd = init_hh + 1;
   dm_start->bk = NULL;
   ms->lfp = dm_start;
 
   /* TODO: make this a macro */
   blkptr dm_end = (blkptr) ((char*)init_hh + rsz);
-  dm_end->size = 1;
+  dm_end->size = 0;             /* memory < rightmost always free at start */
   dm_end->fd = NULL;
   dm_end->bk = dm_end - 1;
   ms->hfp = dm_end;
@@ -219,10 +252,10 @@ static void init_fps_top(blkptr init_hh, mstate ms)
   /* Update top */
   ms->top = dm_start + 1;
   rsz -= kMetadataSize;
-  set_block_size(ms->top, rsz);
+  set_size(ms->top, rsz);
   set_block_free(ms->top);
 
-  update_remainder(ms, rsz);
+  set_remainder(ms, rsz);
 }
 
 /*
@@ -249,9 +282,6 @@ static blkptr init_heap(void)
 
   /* Set fenceposts at both start and end of the heap */
   init_fps_top(heap, ms);
-
-  /* Init bins and place the initial chunk in the largest bin */
-  /* init_bins(ms); */
 
   /* Init bin map */
   ms->binmap = 0;
@@ -297,6 +327,7 @@ static void __insert_normal_bins(int bidx, blkptr mblk)
     init_bin(m, bidx, mblk);
     bin = mblk;
     bin->fd = bin->bk = mblk;
+    set_binmap(m, bidx);
   } else if (has_one(bin)) {    /* 1 free blocks only */
     mblk->fd = bin;
     mblk->bk = bin;
@@ -321,6 +352,7 @@ static void __insert_last_bin(blkptr mblk)
   size_t blksz = blocksize(mblk);
 
   if (is_empty(bin)) {
+    init_bin(m, N_LISTS, mblk);
     bin = mblk;
     bin->fd = bin->bk = mblk;
     return;
@@ -380,38 +412,44 @@ static void insert_into_bin(int bidx, blkptr mblk) {
    suitable bin. */
 static blkptr split_block(blkptr blk, size_t asize)
 {
-  size_t nsz = asize + kMetadataSize; /* needed size */
-  size_t rsz = blocksize(blk) - nsz;  /* remaining size */
+  size_t blk_sz =  blocksize(blk);
+  size_t need_sz = asize + kMetadataSize;
+  size_t left_sz = blk_sz - need_sz;
   blkptr lblk = blk;
   blkptr rblk;
 
-  if (rsz >= MINSIZE) {         /* remainder allocable on its own */
+  if (left_sz >= MINSIZE) {         /* remainder allocable on its own */
     /* take the right block */
-    rblk = (blkptr) ((char*) blk + rsz);
-    set_block_size(rblk, nsz);
-    set_block_inuse(rblk);
-    set_block_foot(rblk);
-    set_block_mem(rblk);
+    rblk = block_at_offset(blk, left_sz);
+    /* this also unsets PREV_INUSE for left blcok */
+    set_size(rblk, need_sz);
 
-    /* collect the left block */
-    set_block_size(lblk, rsz);
-    insert_into_bin(bin_index(rsz), lblk);
+    /* set PREV_INUSE in next block at header and footer */
+    set_inuse(rblk);
+    blkptr nextblk = block_at_offset(rblk, need_sz);
+    set_foot(nextblk, blocksize(nextblk), blocksize_nomask(nextblk));
 
+    /* collect the left block (a pun!) */
+    set_head_size(lblk, left_sz);
+    insert_into_bin(bin_index(left_sz), lblk);
+
+    set_block_memp(rblk);
     return rblk;
-
   } else {                      /* remainder allocated as well */
-    set_block_size(lblk, lblk->size);
-    set_block_inuse(lblk);
-    set_block_foot(lblk);
-    set_block_mem(lblk);
+    /* set PREV_INUSE in next block at header and footer */
+    set_inuse(lblk);
+    blkptr nextblk = block_at_offset(lblk, blk_sz);
+    set_foot(nextblk, blocksize(nextblk), blocksize_nomask(nextblk));
+
+    set_block_memp(lblk);
 
     return lblk;
   }
 }
 
 /* Allocate a free block from given non-empty bin, taking the last
-   free block in the bin and returning pointer to the usable addr of
-   the free block. */
+   free block in the bin and returning pointer to the start of usable
+   memory of the free block. */
 static blkptr __alloc_from_bin(mstate m, int bidx)
 {
   blkptr bin = bin_at(m, bidx);
@@ -423,7 +461,8 @@ static blkptr __alloc_from_bin(mstate m, int bidx)
   if (has_one(bin)) {           /* only one free block */
     mblk = bin;
     /* unlink */
-    bin = NULL;
+    nil_bin_head(m, bidx);
+    unset_binmap(m, bidx);
   } else if (has_two(bin)) {    /* 2 free blocks */
     mblk = bin->bk;
     /* unlink */
@@ -435,28 +474,40 @@ static blkptr __alloc_from_bin(mstate m, int bidx)
     bin->bk->fd = bin;
   }
 
-  set_block_inuse(mblk);
-  set_block_foot(mblk);
+  set_inuse(mblk);
 
-  update_remainder(m, blocksize(mblk));
+  /* set the next block footer too */
+  blkptr nb = block_at_offset(mblk, blocksize(mblk));
+  set_foot(nb, blocksize(nb), blocksize_nomask(nb));
+
+  set_remainder(m, blocksize(mblk));
 
   return mblk;
 }
 
 /* `tsz` is total size for the to-be-allocated block, including both
-   the block size requested by user and overhead (2 boundary tags) */
+   the usable size requested and overhead (2 boundary tags) */
 static blkptr __alloc_from_top(mstate m, size_t tsz)
 {
   blkptr mblk = m->top;
 
-  set_block_size(mblk, tsz);
-  set_block_inuse(mblk);
-  set_block_foot(mblk);
-  update_top(m, mblk, tsz);
+  size_t rsz = m->remainder - tsz;
 
-  set_block_mem(mblk);
+  /* set size for alloc */
+  set_size(mblk, tsz);
 
-  update_remainder(m, m->remainder - tsz);
+  /* set up new top */
+  fd_top(m, mblk, tsz);
+  set_head_size(m->top, rsz);
+
+  /* set PREV_INUSE for new top at header and footer */
+  set_inuse(mblk);
+  set_foot(m->top, blocksize(m->top), blocksize_nomask(m->top));
+
+  /* sub alloc size from remainder */
+  dec_remainder(m, tsz);
+
+  set_block_memp(mblk);
 
   return mblk;
 }
@@ -570,7 +621,7 @@ void* my_malloc(size_t size)
       /* TODO: coalesce  */
     }
 
-    update_remainder(ms, blocksize(heap));
+    dec_remainder(ms, blocksize(heap));
 
   }
 
@@ -612,15 +663,16 @@ void my_free(void *ptr) {
    */
 
   blkptr mblk = (blkptr) ptr;
-  unset_block_mem(mblk);
+  unset_block_memp(mblk);
 
-  set_block_free(mblk);
-  /* TODO: update footer tag */
+  unset_inuse(mblk);
 
   size_t blksz = blocksize(mblk);
+  inc_remainder(m, blksz);
+
   int bidx = bin_index(blksz);
 
-  /* Insert small blcoks to small bins */
+  /* insert small blcoks to small bins */
   if (in_smallbin_range(blksz)) {
     insert_into_bin(bidx, mblk);
   }
