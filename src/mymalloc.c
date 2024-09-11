@@ -27,9 +27,6 @@ const size_t kMemorySize = (64ull << 20);
 /* #define checked_req2size(req)  (((req) + ALIGN_MASK) & ~ALIGN_MASK) */
 
 /* ------------------ Heap block operations  ------------------ */
-#define CURR_INUSE 0x1
-#define SIZE_FLAGS (CURR_INUSE | PREV_INUSE)
-
 /* size field is OR'ed with this flag when previous adjacent block in use */
 #define PREV_INUSE 0x1
 #define FTR_SZ     ((size_t) 8)
@@ -43,26 +40,32 @@ const size_t kMemorySize = (64ull << 20);
 
 #define set_size(b, sz) ((b)->size = (sz))
 
-/* Set and unset the flags */
-#define set_block_inuse(b)    ((b)->size |= CURR_INUSE)
-#define set_block_free(b)     ((b)->size &= ~CURR_INUSE)
-#define set_prevb_inuse(b)    ((b)->size |= PREV_INUSE)
-#define set_prevb_free(b)     ((b)->size &= ~PREV_INUSE)
-
 /* Set size at head, without disturbing its use bit */
-#define set_head_size(b, s)   ((b)->size = (((b)->size & PREV_INUSE) | (s)))
+#define set_head_size(b, s)  ((b)->size = (((b)->size & PREV_INUSE) | (s)))
 
 /* Set size/use field at the same time */
 #define set_head(b, s)  ((b)->size = (s))
 
-/* Set size based on off for footer (used only for free blocks) */
+/* Set size based on `off' for footer (used only for free blocks) */
 #define set_foot(b, off, sz) \
   (((blkptr) ((char *) (b) + ((off) - FTR_SZ)))->size = (sz))
 
 /* Treat space at ptr + offset as a block */
 #define block_at_offset(b, s)  ((blkptr) (((char *) (b)) + (s)))
 
-/* extract b's inuse bit */
+/* Ptr to next block */
+#define next_block(b)  ((blkptr) ((char *) (b)) + blocksize(b))
+
+/* Size of the previous block (below b).  Only valid if !prev_inuse(b) */
+#define prev_size(b)   (((blkptr) ((char *) (b) - FTR_SZ))->size)
+#define prev_block(b)  ((blkptr) ((char *) (b) - prev_size(b)))
+
+
+/* extract inuse bit of prev/next block */
+#define prev_inuse(b)    ((b)->size & PREV_INUSE)
+#define next_inuse(b)    (prev_inuse((block_at_offset(b, blocksize(b)))))
+
+/* check if b is inuse via bit stored at next block */
 #define inuse(b) \
   ((((blkptr) (((char *) (b)) + blocksize(b)))->size) & PREV_INUSE)
 
@@ -92,9 +95,16 @@ const size_t kMemorySize = (64ull << 20);
 #define at_lfp(m)    ((char *) ((m)->lfp) + kMetadataSize)
 #define at_hfp(m)    ((char *) ((m)->hfp))
 
+/* Check if current block is at any of the fenceposts */
+#define next_to_lfp(m, b)    (b == ((m)->lfp + 1))
+#define next_to_hfp(m, b)    (b == (m)->hfp)
+
 /* Check if `top' would hit the highest boundary (hfp) */
 #define checked_top(m, sz) \
   (((char *)((m)->top) + (sz)) <= at_hfp(m))
+
+/* Check next block is top */
+#define next_top(m, b)  (block_at_offset(b, blocksize(b)) == (m)->top)
 
 /* --------------------- Internal data structures --------------------- */
 /*
@@ -230,7 +240,28 @@ int malloc_initialized = -1;
 
  */
 
-/* -------------------- Heap and chunk manupilation  ------------------ */
+/*  ---------- Heap, chunk, internal state manupilation  ---------- */
+
+/*  */
+static void* sysmmap(mstate m)
+{
+  void* mem = mmap(NULL,                        /* let kernel decide */
+                   kMemorySize,                 /* 64MB at a time    */
+                   PROT_READ | PROT_WRITE,      /* prot              */
+                   MAP_PRIVATE | MAP_ANONYMOUS, /* flags             */
+                   0,                           /* fd                */
+                   0                            /* offset            */
+                   );
+
+  if (mem == MAP_FAILED) {
+    LOG("mmap failed: %s\n", strerror(errno));
+    return NULL;
+  }
+
+  return mem;
+}
+
+
 /* See the above diagram for positions of these two fenceposts  */
 static void init_fps_top(blkptr init_hh, mstate ms)
 {
@@ -253,7 +284,6 @@ static void init_fps_top(blkptr init_hh, mstate ms)
   ms->top = dm_start + 1;
   rsz -= kMetadataSize;
   set_size(ms->top, rsz);
-  set_block_free(ms->top);
 
   set_remainder(ms, rsz);
 }
@@ -262,34 +292,23 @@ static void init_fps_top(blkptr init_hh, mstate ms)
   Initialize the `heap', which is the memory chunk totaling 64MB
   to be used for future allocations unless it can no longer satisfiy
  */
-static blkptr init_heap(void)
+static blkptr init_heap(mstate m)
 {
-  blkptr heap = mmap(NULL,                        /* let kernel decide */
-                     kMemorySize,                 /* 64MB at a time    */
-                     PROT_READ | PROT_WRITE,      /* prot              */
-                     MAP_PRIVATE | MAP_ANONYMOUS, /* flags             */
-                     0,                           /* fd                */
-                     0                            /* offset            */
-                     );
+  blkptr heap = sysmmap(m);
 
-  if (heap == MAP_FAILED) {
-    LOG("mmap failed: %s\n", strerror(errno));
+  if (heap == NULL)
     return NULL;
-  }
-
-
-  mstate ms = &mmstate;
 
   /* Set fenceposts at both start and end of the heap */
-  init_fps_top(heap, ms);
+  init_fps_top(heap, m);
 
   /* Init bin map */
-  ms->binmap = 0;
+  m->binmap = 0;
 
   /* Mark initialization */
   malloc_initialized = 0;
 
-  return ms->top;
+  return m->top;
 }
 
 /* Start with current empty bin and search for the nearest next
@@ -528,6 +547,86 @@ static blkptr __try_alloc_from_next(mstate m, int bidx, size_t basize)
   return NULL;
 }
 
+
+static void __merge_with_next(blkptr mblk, blkptr nextblk)
+{
+  size_t new_sz = blocksize(mblk) + blocksize(nextblk);
+  set_head(mblk, new_sz);
+  set_foot(mblk, new_sz, new_sz);
+
+  /* update new next block prev_inuse bit in header and leave
+     its footer untouched as it is inuse thus without footer */
+  unset_inuse(mblk);
+
+  int new_bidx = bin_index(new_sz);
+  insert_into_bin(new_bidx, mblk);
+}
+
+static void __merge_with_prev(blkptr mblk, blkptr prevblk)
+{
+  size_t new_sz = blocksize(prevblk) + blocksize(mblk);
+  set_head(prevblk, new_sz);
+  set_foot(prevblk, new_sz, new_sz);
+
+  unset_inuse(mblk);
+
+  int new_bidx = bin_index(new_sz);
+  insert_into_bin(new_bidx, prevblk);
+}
+
+static void __merge_with_both(blkptr mblk, blkptr nextblk)
+{
+  blkptr prevblk = prev_block(mblk);
+  size_t new_sz = blocksize(prevblk) + blocksize(mblk) + blocksize(nextblk);
+  set_head(prevblk, new_sz);
+  set_foot(prevblk, new_sz, new_sz);
+
+  unset_inuse(nextblk);
+
+  int new_bidx = bin_index(new_sz);
+  insert_into_bin(new_bidx, prevblk);
+}
+
+static void coalesce(mstate m, blkptr mblk, int bidx)
+{
+  blkptr nextblk = next_block(mblk);
+
+  if (prev_inuse(mblk) && next_inuse(nextblk)) {       /* case 1 */
+    insert_into_bin(bidx, mblk);
+  }
+
+  else if (prev_inuse(mblk) && !next_inuse(nextblk)) { /* case 2 */
+    /* if this is last free block right before the rightmost
+       fencepost, insert it to a bin as it cannot coalesce into end;
+       otherwise merge with the next (right) block
+     */
+    if (next_to_hfp(m, nextblk))
+      insert_into_bin(bidx, mblk);
+
+    else
+      __merge_with_next(mblk, nextblk);
+  }
+
+  else if (!prev_inuse(mblk) && next_inuse(nextblk)) { /* case 3 */
+    /* if this is the very 1st free block immediately after leftmost
+       fencepost, insert it to a bin as it cannot coalesce into end;
+       otherwise merge with the next (right) block
+     */
+    blkptr prevblk = prev_block(mblk);
+    if (next_to_lfp(m, prevblk))
+      insert_into_bin(bidx, mblk);
+
+    else
+      __merge_with_prev(mblk, prevblk);
+  }
+
+  else  {                                              /* case 4 */
+    __merge_with_both(mblk, nextblk);
+  }
+}
+
+
+
 /* ----------------- Required helper functions ----------------- */
 /** These are helper functions you are required to implement for
  *  internal testing purposes. Depending on the optimisations you
@@ -575,16 +674,16 @@ void* my_malloc(size_t size)
 
 
   blkptr heap;
-  mstate ms = &mmstate;
+  mstate m = &mmstate;
 
   if (malloc_initialized < 0) {
-    heap = init_heap();
+    heap = init_heap(m);
 
     if (heap == NULL)
       return NULL;
   }
   else
-    heap = ms->top;
+    heap = m->top;
 
 
   /* 1. align requested size to multiple of 8 */
@@ -606,22 +705,25 @@ void* my_malloc(size_t size)
       3. request new huge chunck via mmap
    */
 
-  if (get_binmap(ms, bidx)) {
-    return __alloc_from_bin(ms, bidx);
+  if (get_binmap(m, bidx)) {
+    return __alloc_from_bin(m, bidx);
   }
-  else if (checked_top(ms, total_asz)) {
-    return __alloc_from_top(ms, total_asz);
+  else if (checked_top(m, total_asz)) {
+    return __alloc_from_top(m, total_asz);
   }
   else {
     /* try to alloc from the next larger non-empty  */
-    heap =  __try_alloc_from_next(ms, bidx, basize);
+    heap =  __try_alloc_from_next(m, bidx, basize);
 
-    /* last hope before new mmap: coalescing */
+    /* FIXME: perhaps scanning the entire heap and collect any free
+       blocks would be the last hope before new mmap.  This is garbage
+       collection feature yet to be implemented */
     if (heap == NULL) {
-      /* TODO: coalesce  */
+      /* TODO: multiple syscalls */
+
     }
 
-    dec_remainder(ms, blocksize(heap));
+    dec_remainder(m, blocksize(heap));
 
   }
 
@@ -638,6 +740,7 @@ void my_free(void *ptr) {
   }
 
   mstate m = &mmstate;
+  /* TODO: make these a macro */
   if ((blkptr) ptr < m->lfp || (blkptr) ptr > m->hfp) {
     LOG("Given addr not in the valid range.\n")
     return;
@@ -673,14 +776,11 @@ void my_free(void *ptr) {
   int bidx = bin_index(blksz);
 
   /* insert small blcoks to small bins */
-  if (in_smallbin_range(blksz)) {
+  if (in_smallbin_range(blksz))
     insert_into_bin(bidx, mblk);
-  }
-  /* TODO: Try to coalesce medium-sized or larger blocks */
 
   else
-    insert_into_bin(bidx, mblk);
-
+    coalesce(m, mblk, bidx);
 }
 
 /* ----------------- Test main ----------------- */
@@ -690,6 +790,8 @@ int main(int argc, char* argv[])
   uint32 j;
   for (j = 4; j <= 20; j++) {
     int* fib = (int *) my_malloc(1UL << j);
+
+    assert(fib != NULL);
 
     uint32 i;
     fib[0] = 0;
