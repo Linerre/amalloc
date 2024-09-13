@@ -26,7 +26,7 @@ When deallocating, the allocator tries to respect the above priority: any to-fre
 ## Optimisations
 ### Metadata Reduction
 A normal `Block struct` has size of 40 bytes, this is reduced to 16 bytes for allocated blocks and two fenceposts:
-![metadata-reduct](https://gitlab.cecs.anu.edu.au/u7753813/comp2310-2024-assignment-1/-/blob/main/assets/metadata-reduct.png?ref_type=heads "metadata for free and allocated blocks")
+![metadata-reduct](assets/metadata-reduct.png)
 
 ### Constant time coalescing
 With footer tags in free blocks, there is no need to search any lists for consecutive free blocks.  Each time when freeing a block, the allocator will look only at the block's previous and next neighbors to see if they can be merged with the given one.  One exception is that if the next block is `top`, current free block will merge with `top` only, though this will result in two consecutive free blocks.  In any case, the coalescing takes a constant time.  This is also the approach described in the textbook and lecture.
