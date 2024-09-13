@@ -62,7 +62,7 @@ const size_t kMemorySize = (64ull << 20);
 #define blocksize_nomask(b)  ((b)->size)
 
 /* Like blocksize, but excludes head and index size */
-#define blocksize_nohead(b)  ((b)->size - HDR_SZ)
+#define blocksize_nohead(b)  (blocksize(b) - HDR_SZ)
 
 #define set_size(b, sz) ((b)->size = (sz))
 
@@ -82,8 +82,8 @@ const size_t kMemorySize = (64ull << 20);
 /* Ptr to next block */
 #define next_block(b)  ((blkptr) ((char *) (b) + blocksize(b)))
 
-/* Size of the previous block (below b).  Only valid if !prev_inuse(b) */
-#define prev_size(b)   (((blkptr) ((char *) (b) - FTR_SZ))->size)
+/* Size of the previous block (below b) */
+#define prev_size(b)   (((blkptr) ((char *) (b) - FTR_SZ))->size & ~ALIGN_MASK)
 #define prev_block(b)  ((blkptr) ((char *) (b) - prev_size(b)))
 
 
@@ -533,7 +533,7 @@ static blkptr __alloc_from_bin(mstate m, int bidx)
   set_inuse(mblk);
 
   /* set the next block footer too */
-  blkptr nb = block_at_offset(mblk, blocksize(mblk));
+  blkptr nb = next_block(mblk);
   set_foot(nb, blocksize(nb), blocksize_nomask(nb));
 
 
@@ -547,8 +547,8 @@ static blkptr __alloc_from_top(mstate m, size_t tsz)
   blkptr mblk = m->top;
   size_t rsz = blocksize(m->top) - tsz;
 
-  /* set size for alloc */
-  set_size(mblk, tsz);
+  /* set head size for alloc but inherit top's PREV_INUSE bit */
+  set_head_size(mblk, tsz);
   set_mindex(mblk, m->mindex);
 
   /* set up new top */
@@ -614,12 +614,12 @@ static void __merge_with_top(mstate m, blkptr mblk)
   /* new head should maintain the PREV_INUSE bit */
   size_t new_tsz = blocksize_nomask(mblk) + blocksize(m->top);
 
-  set_head(mblk, new_tsz);
+  /* retain the PREV_INUSE bit */
+  set_head_size(mblk, new_tsz);
   set_foot(mblk, new_tsz, new_tsz);
   set_mindex(mblk, m->mindex);
 
   /* top should _always_ next to hfp so no need to unset inuse */
-  /* unset_inuse(mblk); */
 
   /* update top */
   m->top = mblk;
@@ -632,7 +632,7 @@ static void __merge_with_next(mstate m, blkptr mblk, blkptr nextblk)
   size_t new_tsz = blocksize_nomask(mblk) + blocksize(nextblk);
   size_t new_asz = blocksize_nohead(mblk) + blocksize(nextblk);
 
-  set_head(mblk, new_tsz);
+  set_head_size(mblk, new_tsz);
   set_foot(mblk, new_tsz, new_tsz);
   set_mindex(mblk, m->mindex);
 
@@ -656,11 +656,13 @@ static void __merge_with_prev(mstate m, blkptr mblk, blkptr prevblk)
 
   size_t new_tsz = blocksize(prevblk) + blocksize(mblk);
   size_t new_asz = blocksize_nohead(prevblk) + blocksize(mblk);
-  set_head(prevblk, new_tsz);
+
+  /* retian PREV_INUSE bit */
+  set_head_size(prevblk, new_tsz);
   set_foot(prevblk, new_tsz, new_tsz);
   set_mindex(prevblk, m->mindex);
 
-  unset_inuse(mblk);
+  unset_inuse(prevblk);
 
   int new_bidx = bin_index(new_asz);
   insert_into_bin(m, prevblk, new_bidx);
@@ -675,11 +677,13 @@ __merge_with_both(mstate m, blkptr mblk, blkptr prevblk, blkptr nextblk)
 
   size_t new_tsz = blocksize(prevblk) + blocksize(mblk) + blocksize(nextblk);
   size_t new_asz = blocksize_nohead(prevblk) + blocksize(mblk) + blocksize(nextblk);
-  set_head(prevblk, new_tsz);
+
+  /* retian PREV_INUSE bit */
+  set_head_size(prevblk, new_tsz);
   set_foot(prevblk, new_tsz, new_tsz);
   set_mindex(prevblk, m->mindex);
 
-  unset_inuse(nextblk);
+  unset_inuse(prevblk);
 
   int new_bidx = bin_index(new_asz);
   insert_into_bin(m, mblk, new_bidx);
@@ -717,7 +721,7 @@ static void coalesce(mstate m, blkptr mblk, int bidx)
       insert_into_bin(m, mblk, bidx);
 
     else
-      __merge_with_prev(m, prevblk, mblk);
+      __merge_with_prev(m, mblk, prevblk);
   }
 
   else  {                                              /* case 4 */
@@ -924,7 +928,9 @@ void my_free(void *ptr) {
     return;
   }
 
-  /* unset inuse early but easily causes confusion later */
+  /* retore footer for the given block */
+  set_foot(mblk, blocksize(mblk), blocksize_nomask(mblk));
+  /* update header and footer for the next block */
   unset_inuse(mblk);
   blkptr nextblk = next_block(mblk);
   set_foot(nextblk, blocksize(nextblk), blocksize(nextblk));
@@ -960,17 +966,14 @@ int main(int argc, char* argv[])
   void *fib1 =  my_malloc(123);
   assert(fib1 != NULL);
   memset(fib1, 0, 123);
-  /* my_free(fib1); */
 
   /* Test medium */
   int* fib2 = (int *) my_malloc(4011);
   assert(fib2 != NULL);
-  /* my_free(fib2); */
 
   /* Test large */
   int* fib3 = (int *) my_malloc(1UL << 20);
   assert(fib3 != NULL);
-  /* my_free(fib3); */
 
   my_free(fib1);                /* expect to be put in a bin */
   my_free(fib2);                /* expect to merge with fib1 */
