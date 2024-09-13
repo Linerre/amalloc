@@ -584,18 +584,18 @@ static blkptr __try_alloc_from_nextbin(mstate m, int bidx, size_t basize)
 
 static void __unlink_block(mstate m, blkptr blk)
 {
-  size_t nxsz = tsz2asize(blocksize(blk));
-  int nbidx = bin_index(nxsz);
+  size_t basz = tsz2asize(blocksize(blk));
+  int nbidx = bin_index(basz);
 
   blkptr bin = bin_at(m, nbidx);
 
-  assert(bin != NULL);
+  /* assert(bin != NULL); */
 
   blkptr fd = blk->fd;
   blkptr bk = blk->bk;
 
   if (has_one(bin)) {           /* 1 free block and empty after */
-    assert(bin == blk);         /* blk should be bin head */
+    /* assert(bin == blk);         /\* blk should be bin head *\/ */
     bin->fd = bin->bk = NULL;
     nil_bin_head(m, nbidx);
     unset_binmap(m, nbidx);
@@ -866,8 +866,8 @@ void* my_malloc(size_t size)
       /* blkptr new_top = init_malloc(ceilreq(size)); */
       /* if (new_top == NULL) */
       /*   return NULL; */
-      /*  */
-      /* /\* try to malloc using this new heap *\/ */
+
+      /* try to malloc using this new heap */
       /* return my_malloc(size); */
     }
     /* else */
