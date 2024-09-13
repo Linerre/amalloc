@@ -474,9 +474,7 @@ static blkptr split_block(mstate m, blkptr blk, size_t asize)
   if (left_sz >= MINSIZE) {         /* remainder allocable on its own */
     /* take the right block */
     rblk = block_at_offset(blk, left_sz);
-    /* this also unsets PREV_INUSE for left blcok.  No need to set
-       index as blocks in bins (except top) should already have
-       correct index */
+    /* this also unsets PREV_INUSE for left blcok */
     set_size(rblk, need_sz);
     set_mindex(rblk, m->mindex);
 
@@ -494,13 +492,13 @@ static blkptr split_block(mstate m, blkptr blk, size_t asize)
     return rblk;
   } else {                      /* remainder allocated as well */
     /* set PREV_INUSE in next block at header and footer */
-    set_inuse(lblk);
-    blkptr nextblk = block_at_offset(lblk, blk_sz);
+    set_inuse(blk);
+    blkptr nextblk = next_block(blk);
     set_foot(nextblk, blocksize(nextblk), blocksize_nomask(nextblk));
 
-    set_memp(lblk);
+    set_memp(blk);
 
-    return lblk;
+    return blk;
   }
 }
 
@@ -772,15 +770,38 @@ blkptr get_start_block(void) {
   return block_at_offset(m->lfp, HDR_SZ);
 }
 
-/* Returns the next block in memory */
+/* Returns the next block in memory.  Note: this implementation can
+   _only_ return the next block of current heap if there are multiple
+   ones.  Fenceposts are excluded (not treated as normal blocks) */
 blkptr get_next_block(blkptr block) {
-  return NULL;
+  hinfo h = &heap_info;
+  if (h == NULL) {
+    LOG("Failed to get next block: unkonwn heap info\n");
+    return NULL;
+  }
+
+  if (h->current == NULL) {
+    LOG("Failed to get next block: no current malloc state\n");
+    return NULL;
+  }
+
+  mstate m = h->current;
+
+  if (m->hfp == NULL) {
+    LOG("Failed to get next block: current malloc has no right fencepost\n");
+    return NULL;
+  }
+
+  if (next_to_hfp(m, block))
+    return NULL;
+  else
+    return next_block(block);
 }
 
 /* Given a ptr assumed to be returned from a previous call to `my_malloc`,
    return a pointer to the start of the metadata block. */
 blkptr ptr_to_block(void *ptr) {
-  return unset_memp(ptr);
+  return (blkptr) ((char *)ptr - HDR_SZ);
 }
 
 /* ----------------- Core malloc/free functions ----------------- */
@@ -893,14 +914,13 @@ void my_free(void *ptr) {
 
   /* In case user modifies the block index by mistake or intentionally */
   if (mblk < at_lfp(m) || mblk > at_hfp(m)) {
-    LOG("Free failed: block address not in valid range.\n")
+    LOG("Free failed: block address not in valid range.\n");
     return;
   }
 
   /* Check double free error */
   if (!(inuse(mblk))) {
-    LOG("Double free erro\n");
-    /* TODO: set errno */
+    LOG("Double free error\n");
     return;
   }
 
