@@ -1,6 +1,7 @@
 #include "mymalloc.h"
 #include <assert.h>
 #include <stdlib.h>
+#include <string.h>
 #include <errno.h>
 /* --------------------- Assigment requirements --------------------- */
 const size_t kAlignment = sizeof(size_t);
@@ -108,20 +109,22 @@ const size_t kMemorySize = (64ull << 20);
 /* Set block index to the curret malloc_state it belongs to */
 #define set_mindex(b, i) ((b)->mindex = (i))
 
-#define inc_remainder(m, sz) ((m)->remainder += (sz))
-#define dec_remainder(m, sz) ((m)->remainder -= (sz))
-#define set_remainder(m, sz) ((m)->remainder = (sz))
+/* #define inc_remainder(m, sz) ((m)->remainder += (sz)) */
+/* #define dec_remainder(m, sz) ((m)->remainder -= (sz)) */
+/* #define set_remainder(m, sz) ((m)->remainder = (sz)) */
 
 /* Move top forward (to higher addr) or backward (to lower addr) */
 #define fd_top(m, b, sz)  ((m)->top = (blkptr)((char *)(b) + sz))
 #define bk_top(m, b, sz)  ((m)->top = (blkptr)((char *)(b) - sz))
 
+#define at_top(m, b) ((m)->top == (b))
 #define at_lfp(m)    ((blkptr) ((char *) ((m)->lfp) + HDR_SZ))
 #define at_hfp(m)    ((m)->hfp)
 
 /* Check if current block is at any of the fenceposts */
 #define next_to_lfp(m, b)    (b == ((m)->lfp + 1))
 #define next_to_hfp(m, b)    (b == (m)->hfp)
+#define next_to_top(m, b)    (next_block(b) == (m)->top)
 
 /* Check if `top' would hit the highest boundary (hfp) */
 #define checked_top(m, sz) \
@@ -243,7 +246,6 @@ struct malloc_state {
   blkptr lfp;         /* low fencepost, after state and before top */
   blkptr hfp;         /* high fencepost, marks end of the chunk */
   blkptr bins[NBINS]; /* see bin comments above; bin[0] does not exist */
-  size_t remainder;   /* available space of this chunk */
   uint64 binmap;      /* 64-bit bitvector to track bins status */
   uint64 mindex;      /* index of current heap */
 };
@@ -308,19 +310,17 @@ static void __init_malloc_state(mstate m, size_t csz)
     m->bins[i] = NULL;
 
 
-  /* init lfp, hfp, and top.  Note: fenceposts are shrinked to have
+  /* init lfp, hfp.  Note: fenceposts are shrinked to have
      `size' and `mindex' fields only to save space  */
   m->lfp = (blkptr) ((char *)m + MSTATE_SZ);
   m->lfp->mindex = m->mindex;
-  m->top = (blkptr) ((char *)m->lfp + HDR_SZ) ;
-  m->top->mindex = m->mindex;
   m->hfp = (blkptr) ((char *)m + csz - HDR_SZ);
   m->hfp->mindex = m->mindex;
 
-
-  /* init other fields */
-  m->remainder = csz - HEAP_OVERHEAD;
-
+  /* init top */
+  m->top = (blkptr) ((char *)m->lfp + HDR_SZ) ;
+  m->top->mindex = m->mindex;
+  m->top->size = csz - HEAP_OVERHEAD;
 }
 
 /*
@@ -533,7 +533,6 @@ static blkptr __alloc_from_bin(mstate m, int bidx)
   blkptr nb = block_at_offset(mblk, blocksize(mblk));
   set_foot(nb, blocksize(nb), blocksize_nomask(nb));
 
-  set_remainder(m, blocksize(mblk));
 
   return mblk;
 }
@@ -543,8 +542,7 @@ static blkptr __alloc_from_bin(mstate m, int bidx)
 static blkptr __alloc_from_top(mstate m, size_t tsz)
 {
   blkptr mblk = m->top;
-
-  size_t rsz = m->remainder - tsz;
+  size_t rsz = blocksize(m->top) - tsz;
 
   /* set size for alloc */
   set_size(mblk, tsz);
@@ -557,10 +555,8 @@ static blkptr __alloc_from_top(mstate m, size_t tsz)
 
   /* set PREV_INUSE for new top at header and footer */
   set_inuse(mblk);
-  set_foot(m->top, blocksize(m->top), rsz);
-
-  /* sub alloc size from remainder */
-  dec_remainder(m, tsz);
+  set_foot(m->top, blocksize(m->top), blocksize_nomask(m->top));
+  assert(m->top->size % 2 != 0);
 
   set_memp(mblk);
 
@@ -583,10 +579,28 @@ static blkptr __try_alloc_from_nextbin(mstate m, int bidx, size_t basize)
   return NULL;
 }
 
+/* Merge given block with top without any bin insertions */
+static void __merge_with_top(mstate m, blkptr mblk)
+{
+  /* new head should maintain the PREV_INUSE bit */
+  size_t new_tsz = blocksize_nomask(mblk) + blocksize(m->top);
 
+  set_head(mblk, new_tsz);
+  set_foot(mblk, new_tsz, new_tsz);
+  set_mindex(mblk, m->mindex);
+
+  /* top should _always_ next to hfp so no need to unset inuse */
+  /* unset_inuse(mblk); */
+
+  /* update top */
+  m->top = mblk;
+}
+
+/* Like above, but the next is not top */
 static void __merge_with_next(mstate m, blkptr mblk, blkptr nextblk)
 {
-  size_t new_tsz = blocksize(mblk) + blocksize(nextblk);
+  /* new head should maintain the PREV_INUSE bit */
+  size_t new_tsz = blocksize_nomask(mblk) + blocksize(nextblk);
   size_t new_asz = blocksize_nohead(mblk) + blocksize(nextblk);
 
   set_head(mblk, new_tsz);
@@ -597,14 +611,11 @@ static void __merge_with_next(mstate m, blkptr mblk, blkptr nextblk)
      its footer untouched as it is inuse thus without footer */
   unset_inuse(mblk);
 
+  /* TODO: unlink next from its bin */
+
   /* when next block is top, just update top to align with alloc priority */
-  if (nextblk == m->top) {
-    m->top = mblk;
-    return;
-  } else {
-    int new_bidx = bin_index(new_asz);
-    insert_into_bin(m, mblk, new_bidx);
-  }
+  int new_bidx = bin_index(new_asz);
+  insert_into_bin(m, mblk, new_bidx);
 }
 
 static void __merge_with_prev(mstate m, blkptr mblk, blkptr prevblk)
@@ -633,7 +644,7 @@ static void __merge_with_both(mstate m, blkptr mblk, blkptr nextblk)
   unset_inuse(nextblk);
 
   /* when next block is top, just update top to align with alloc priority */
-  if (nextblk == m->top) {
+  if (at_top(m, nextblk)) {
     m->top = prevblk;
     return;
   } else {
@@ -776,11 +787,11 @@ void* my_malloc(size_t size)
   /* 2. determin size class list */
   int bidx = bin_index(blk_asz);
 
-  if (get_binmap(m, bidx)) {
-    return __alloc_from_bin(m, bidx);
-  }
-  else if (checked_top(m, total_asz)) {
+  if (checked_top(m, total_asz)) {
     return __alloc_from_top(m, total_asz);
+  }
+  else if (get_binmap(m, bidx)) {
+    return __alloc_from_bin(m, bidx);
   }
   else {
     /* try to alloc from the next larger non-empty bin */
@@ -799,7 +810,7 @@ void* my_malloc(size_t size)
       /* return my_malloc(size); */
     }
     /* else */
-    dec_remainder(m, blocksize(mblk));
+
   }
 
   /* 4. allocate */
@@ -857,19 +868,21 @@ void my_free(void *ptr) {
     return;
   }
 
+  /* unset inuse early but easily causes confusion later */
   unset_inuse(mblk);
   blkptr nextblk = next_block(mblk);
-  set_foot(nextblk, blocksize(mblk), blocksize(mblk));
-  /* TODO: unset foot of next chunk */
+  set_foot(nextblk, blocksize(nextblk), blocksize(nextblk));
 
   size_t blktsz = blocksize(mblk);
   size_t blkasz = blktsz == MINSIZE ? MINSIZE : blocksize_nohead(mblk);
-  inc_remainder(m, blktsz);
 
   int bidx = bin_index(blkasz);
 
-  /* insert small blcoks to small bins */
-  if (in_smallbin_range(blkasz))
+  if (next_to_top(m, mblk))
+    __merge_with_top(m, mblk);
+
+
+  else if (in_smallbin_range(blkasz))
     insert_into_bin(m, mblk, bidx);
 
   else
@@ -881,9 +894,11 @@ int main(int argc, char* argv[])
 {
 
   /* Test small */
-  int* fib = (int *) my_malloc(253);
+  void *fib =  my_malloc(123);
 
   assert(fib != NULL);
+
+  memset(fib, 0, 123);
 
   my_free(fib);
 
